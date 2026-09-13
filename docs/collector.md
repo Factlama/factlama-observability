@@ -1,7 +1,0 @@
-# Collector and ingestion
-
-Ingress accepts authenticated FactLama SDK events and OTLP-compatible telemetry on documented endpoints. Validate identity, project authorization, schema, payload size, timestamp skew and attribute limits before queueing. Tenant identity comes from credentials, never from an unverified span attribute. Normalize to the telemetry model, apply content capture/redaction policy before any durable queue or log, then route to storage and optional export. The collector must not invoke verification implicitly for every span; evaluation is triggered by explicit SDK/API configuration and routed to Reliability through its public contract.
-
-The SDK is best effort on customer inference paths: bounded memory queue, short/nonblocking send, configurable sampling and fail-open default. The collector applies bounded queues, per-tenant quotas, batch limits and backpressure. Prefer explicit 429/503 with retry hints over unbounded buffering. Retry transient downstream errors with jitter and a cap; record dropped/rejected counts by reason. Do not log payload bodies on failure. Preserve trace context across async boundaries. Expose health/readiness separately and self-metrics for ingress rate, queue depth, lag, retries, drops, redaction failures and storage/export latency.
-
-Contract tests include valid OTLP and SDK events, invalid tenant/oversized input, duplicate delivery, out-of-order spans, storage outage, queue saturation, metadata-only capture, and delayed Reliability events.
