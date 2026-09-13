@@ -1,0 +1,5 @@
+# SDK and instrumentation contract
+
+First SDK target is a minimal integration that propagates W3C trace context, establishes interaction ID, records LLM/RAG/tool metadata and sends OTLP-compatible telemetry. A direct `verify` call submits the shared `VerificationRequest`; asynchronous calls return a job handle. Instrumentation must be opt-in, bounded in memory/time, and fail open for telemetry on the customer inference path. Explicit enforcement of a synchronous policy action is a separate opt-in application decision.
+
+Default capture is metadata-only. Prompts, responses, retrieved content, tool arguments/results and judge text are excluded unless tenant capture settings allow them; redaction occurs before SDK export where possible and again at ingress. Never capture credentials. SDK configuration names endpoint, auth credential reference, project/application, capture mode, sampling, queue/flush bounds and verification trigger. Documentation must include one direct API example and one instrumented LLM/RAG example with trace/evaluation correlation. Test network outage, bounded queue, cancellation, context propagation and content suppression.

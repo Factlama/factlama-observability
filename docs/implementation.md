@@ -1,5 +1,7 @@
 # Observability Implementation Plan
 
+For concrete SDK, collector, processing, storage/query, dashboard and acceptance behavior, use [LOW_LEVEL_IMPLEMENTATION.md](LOW_LEVEL_IMPLEMENTATION.md). This file owns task status; a task is not complete solely because it appears in the specification.
+
 Status values: `NOT_STARTED`, `IN_PROGRESS`, `BLOCKED`, `COMPLETE`.
 
 A task is COMPLETE only when code, tests, failure handling, tenant isolation, telemetry, documentation, and acceptance criteria are satisfied.
@@ -86,6 +88,27 @@ A task is COMPLETE only when code, tests, failure handling, tenant isolation, te
 - [ ] Seed/example application.
 - [ ] Document startup and validation workflow.
 - [ ] End-to-end smoke test.
+
+## OBS-13 SDK instrumentation — STATUS: NOT_STARTED
+- [ ] Minimal opt-in SDK with W3C context propagation and bounded best-effort export.
+- [ ] Direct verification call and an instrumented LLM/RAG example.
+- [ ] Metadata-only capture and network-outage tests.
+
+**Acceptance:** example trace and evaluation correlate without persisting raw interaction content.
+
+## OBS-14 Cost and usage provenance — STATUS: NOT_STARTED
+- [ ] Versioned price source, currency and calculation method.
+- [ ] Unknown token/price data reported as unavailable, not zero.
+- [ ] Aggregate accuracy tests for duplicated and late events.
+
+## OBS-15 Optional Interaction Store — STATUS: NOT_STARTED
+- [ ] Implement only after ADR-008 privacy, retention, deletion and access requirements are funded and tested.
+- [ ] Keep it outside the MVP runtime dependency graph.
+
+## OBS-16 Enterprise hardening — STATUS: NOT_STARTED
+- [ ] External identity/SSO/RBAC integration, managed storage and secrets.
+- [ ] Kubernetes, data residency, exporters and upgrade/migration support.
+- [ ] Production load, backup/restore and security verification.
 
 ## MVP end-product expectation
 

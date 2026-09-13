@@ -1,5 +1,7 @@
 # FactLama Observability
 
+Start with [the low-level implementation checklist](docs/LOW_LEVEL_IMPLEMENTATION.md) to see the SDK, collector, query, dashboard and reviewer tests. Supporting specifications: [telemetry model](docs/telemetry-model.md), [collector](docs/collector.md), [storage and query](docs/storage-query.md), [dashboard](docs/dashboard.md), and [SDK](docs/SDK.md). The architecture repository's `CONTRACTS.md` owns shared wire semantics.
+
 FactLama Observability is the AI-native telemetry and dashboard layer for LLM, RAG and agentic applications.
 
 The system-level source of truth lives in `Factlama/factlama-architecture`. This repository implements the observability contracts and must not silently redefine system boundaries.
@@ -203,112 +205,7 @@ The same information must be accessible through documented query APIs, not dashb
 
 ## Implementation plan and status
 
-Status values: `NOT_STARTED`, `IN_PROGRESS`, `BLOCKED`, `COMPLETE`.
-
-### OBS-01 Repository/Foundation - STATUS: NOT_STARTED
-
-- [ ] Choose runtime/package layout.
-- [ ] Add lint/type/test tooling.
-- [ ] Add configuration conventions.
-- [ ] Add CI.
-- [ ] Document development commands.
-
-Acceptance: clean checkout installs/builds/tests successfully.
-
-### OBS-02 Telemetry Contract - STATUS: NOT_STARTED
-
-- [ ] Define supported OTEL inputs and FactLama AI semantic attributes.
-- [ ] Define tenant/application/interaction/evaluation correlation fields.
-- [ ] Define normalization rules and versioning.
-- [ ] Add contract tests.
-
-Acceptance: representative LLM/retrieval/tool/evaluation events normalize deterministically.
-
-### OBS-03 Collector and Ingestion Vertical Slice - STATUS: NOT_STARTED
-
-- [ ] Accept supported telemetry input.
-- [ ] Validate and normalize.
-- [ ] Enforce tenant context.
-- [ ] Record rejected/dropped event telemetry.
-- [ ] Persist through storage abstraction.
-
-Acceptance: a sample instrumented application produces queryable traces/events without direct database coupling in ingestion logic.
-
-### OBS-04 Storage and Query API - STATUS: NOT_STARTED
-
-- [ ] Define telemetry/trace storage interfaces.
-- [ ] Implement MVP backing store.
-- [ ] Implement request/trace/model/cost/reliability queries.
-- [ ] Add pagination/filter/time-range behavior.
-- [ ] Add tenant isolation tests.
-
-Acceptance: dashboard-required queries work against stable APIs and tenant A cannot query tenant B data.
-
-### OBS-05 Reliability Correlation - STATUS: NOT_STARTED
-
-- [ ] Consume/accept reliability signals/results.
-- [ ] Correlate evaluation ID to interaction/trace.
-- [ ] Expose reliability summary/drill-down query models.
-
-Acceptance: an evaluated interaction can be found from either trace or evaluation identifier.
-
-### OBS-06 Native Dashboard MVP - STATUS: NOT_STARTED
-
-- [ ] AI overview page.
-- [ ] LLM requests/models view.
-- [ ] token/cost view.
-- [ ] reliability view.
-- [ ] trace explorer.
-- [ ] error states/loading/empty states.
-
-Acceptance: a clean demo dataset or live sample clearly shows the end-to-end FactLama value without requiring another observability UI.
-
-### OBS-07 SDK Instrumentation - STATUS: NOT_STARTED
-
-- [ ] Minimal app initialization.
-- [ ] LLM request metadata instrumentation.
-- [ ] retrieval/tool event hooks.
-- [ ] correlation ID propagation.
-- [ ] examples.
-
-Acceptance: sample application requires minimal code changes and emits valid telemetry.
-
-### OBS-08 Cost and Usage - STATUS: NOT_STARTED
-
-- [ ] Token normalization.
-- [ ] Provider/model pricing configuration interface.
-- [ ] Estimated cost calculation with provenance/version.
-- [ ] Aggregate queries.
-
-Acceptance: cost numbers show source/configuration and are not silently treated as provider billing truth.
-
-### OBS-09 Alerts/Regression Foundation - STATUS: NOT_STARTED
-
-- [ ] Alert-rule model.
-- [ ] reliability/error/latency threshold foundations.
-- [ ] regression comparison query foundations.
-
-### OBS-10 Exporters/Integrations - STATUS: NOT_STARTED
-
-- [ ] Exporter interface.
-- [ ] OTEL/Prometheus-compatible export path where appropriate.
-- [ ] document integration patterns for enterprise observability stacks.
-
-### OBS-11 Interaction Store Integration - STATUS: NOT_STARTED
-
-Future scope. Do not block MVP on this.
-
-- [ ] optional content-store interface;
-- [ ] capture-mode integration;
-- [ ] replay/query hooks;
-- [ ] retention/redaction behavior.
-
-### OBS-12 Enterprise Hardening - STATUS: NOT_STARTED
-
-- [ ] RBAC/SSO integration points;
-- [ ] deployment scaling patterns;
-- [ ] audit/data controls;
-- [ ] performance/load validation.
+[`docs/implementation.md`](docs/implementation.md) is the sole status ledger for OBS tasks. Its task IDs, acceptance criteria and `NOT_STARTED` state are authoritative. This README describes architecture and must not duplicate task numbering.
 
 ## Claude implementation instructions
 
