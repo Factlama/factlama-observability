@@ -10,6 +10,7 @@ import pytest
 @pytest.mark.parametrize(
     "module_name",
     [
+        "schemas",
         "sdk",
         "collector",
         "collector.ingress",
