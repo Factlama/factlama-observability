@@ -13,3 +13,7 @@ Use [CLAUDE.md](CLAUDE.md) or [CODEX.md](CODEX.md) to select only the architectu
 - `tests/` -- covers `operations/`, `schemas/`, the package-layout/dependency-boundary contract, and (`test_contract_fixtures.py`) every canonical `contracts/v0.1` `ReliabilityEvent` fixture parsing through `schemas.ReliabilityEvent`.
 
 Run the Python checks: `pip install -e ".[dev,storage]" && ruff check . && ruff format --check . && mypy schemas sdk collector storage query operations && lint-imports && pytest`. The contract-fixture tests need `contracts/v0.1` locally reachable at `../factlama-architecture` (the three-repo workspace layout) or via `FACTLAMA_CONTRACTS_DIR`; they skip cleanly otherwise.
+
+## Contributing and license
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the signed-off commit and pull-request workflow. FactLama Observability is licensed under the [Apache License 2.0](LICENSE); third-party SDKs, exporters and storage dependencies retain their own licenses.
