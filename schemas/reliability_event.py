@@ -14,6 +14,12 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+# Mirrors operations/versioning.py's check_schema_version rule (accept an
+# unknown minor, reject an unknown major) inline rather than importing it --
+# this repo's import-linter contract keeps `schemas` a pure data layer with
+# no dependency on `operations`.
+SUPPORTED_SCHEMA_MAJOR_VERSION = "0"
+
 
 class ResultStatus(str, Enum):
     """Pipeline execution status, echoed from the originating VerificationResult."""
@@ -113,6 +119,20 @@ class ReliabilityEvent(BaseModel):
     )
     qualification_status: QualificationStatusOrMixed
     usage_summary: Usage = Field(default_factory=Usage)
+
+    @model_validator(mode="after")
+    def validate_schema_version(self) -> "ReliabilityEvent":
+        """CONTRACTS.md: "Implementations MUST reject unknown major versions,
+        MAY ignore unknown additive fields within a supported major version."
+        Previously this field accepted any string, including an unknown
+        major such as "9.0"."""
+        major = self.schema_version.split(".")[0]
+        if major != SUPPORTED_SCHEMA_MAJOR_VERSION:
+            raise ValueError(
+                f"Unsupported schema version: {self.schema_version}. "
+                f"Supported major version: {SUPPORTED_SCHEMA_MAJOR_VERSION}"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_mixed_calibration_class_has_classes(self) -> "ReliabilityEvent":
