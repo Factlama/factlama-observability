@@ -33,7 +33,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install package with dev extras
-        run: pip install -e ".[dev,storage]"
+        run: pip install -e ".[dev]"
 
       - name: Lint (ruff check)
         run: ruff check .
@@ -47,15 +47,15 @@ jobs:
       - name: Dependency-boundary check (import-linter)
         run: lint-imports
 
-      - name: Tests (pytest), including the OBS-03 contract fixture suite
+      # OBS-06 (mirrors factlama-reliability's ADR-019 SS4): tests/conformance/
+      # needs a real PostgreSQL instance, not mocks. testcontainers
+      # launches/tears down its own throwaway container via the Docker
+      # daemon ubuntu-latest runners already have -- no `services:` block
+      # needed.
+      - name: Tests (pytest), including the OBS-03 contract fixture suite and OBS-06 storage conformance
         run: pytest --cov=schemas --cov=sdk --cov=collector --cov=storage --cov=query --cov=operations --cov-report=term-missing
         env:
           FACTLAMA_CONTRACTS_DIR: ${{ github.workspace }}/factlama-architecture/contracts/v0.1
-
-      - name: Alembic no-op migration smoke test
-        run: alembic -c storage/migrations/alembic.ini upgrade head
-        env:
-          DATABASE_URL: sqlite:///./_ci_alembic_smoke.db
 
   dashboard:
     runs-on: ubuntu-latest

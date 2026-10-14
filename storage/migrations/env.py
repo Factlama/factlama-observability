@@ -1,31 +1,48 @@
-"""Alembic environment: connects via DATABASE_URL, zero revisions until OBS-06.
+"""Alembic environment, wired for the async `postgresql+asyncpg://` engine
+this repo now standardizes on (`storage/postgres/engine.py`), mirroring
+`factlama-reliability/migrations/env.py`'s async-Alembic recipe: run
+migrations inside `AsyncConnection.run_sync`, since Alembic's own migration
+machinery is synchronous.
 
-There is no ORM model layer yet (OBS-06 defines the `spans`,
-`reliability_events`, `evaluation_links`, and pricing/config tables), so
-`target_metadata` is intentionally `None` -- `alembic revision --autogenerate`
-cannot be used until that layer exists; revisions are written by hand.
+OBS-06 gives this file its first real table (`reliability_events`) --
+`target_metadata` was `None` until now because no ORM model layer existed
+to autogenerate against; revisions are still written by hand (`op.create_table`),
+kept in lockstep with `storage/postgres/tables.py`.
 """
 
+import asyncio
 import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
+from storage.postgres.tables import metadata
 
 config = context.config
+
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = None
+target_metadata = metadata
 
 
-def get_url() -> str:
-    return os.environ["DATABASE_URL"]
+def _database_url() -> str:
+    url = os.environ.get("FACTLAMA_DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "FACTLAMA_DATABASE_URL must be set (postgresql+asyncpg://...) to run migrations"
+        )
+    return url
 
 
 def run_migrations_offline() -> None:
+    """Emit SQL to stdout without a live database connection (`alembic
+    upgrade head --sql`)."""
     context.configure(
-        url=get_url(),
+        url=_database_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -34,18 +51,24 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
-    configuration = config.get_section(config.config_ini_section) or {}
-    configuration["sqlalchemy.url"] = get_url()
-    connectable = engine_from_config(configuration, prefix="sqlalchemy.", poolclass=pool.NullPool)
+def _do_run_migrations(connection: Connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
+    with context.begin_transaction():
+        context.run_migrations()
 
-    with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-        with context.begin_transaction():
-            context.run_migrations()
+
+async def run_migrations_online() -> None:
+    configuration = config.get_section(config.config_ini_section) or {}
+    configuration["sqlalchemy.url"] = _database_url()
+    connectable = async_engine_from_config(
+        configuration, prefix="sqlalchemy.", poolclass=pool.NullPool
+    )
+    async with connectable.connect() as connection:
+        await connection.run_sync(_do_run_migrations)
+    await connectable.dispose()
 
 
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    run_migrations_online()
+    asyncio.run(run_migrations_online())
