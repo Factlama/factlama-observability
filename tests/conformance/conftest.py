@@ -65,11 +65,15 @@ def make_event(
     event_id: str = "event-1",
     tenant_id: str = "tenant-a",
     evaluation_id: str = "eval-1",
+    project_id: str | None = None,
+    application_id: str | None = None,
 ) -> ReliabilityEvent:
     return ReliabilityEvent(
         event_id=event_id,
         tenant_id=tenant_id,
         evaluation_id=evaluation_id,
+        project_id=project_id,
+        application_id=application_id,
         occurred_at=datetime.now(timezone.utc).isoformat(),
         status=ResultStatus.COMPLETED,
         verdict=OverallVerdict.PASS,

@@ -21,6 +21,7 @@ exceptions.
 from typing import Protocol
 
 from schemas.reliability_event import ReliabilityEvent
+from schemas.tenancy import TenantContext
 
 
 class TelemetryStore(Protocol):
@@ -41,4 +42,19 @@ class TelemetryStore(Protocol):
         Raises `storage.errors.StorageUnavailableError` if the durable
         store cannot be reached.
         """
+        ...
+
+    async def get_reliability_event(
+        self, tenant: TenantContext, evaluation_id: str
+    ) -> ReliabilityEvent | None:
+        """OBS-07's first read route, `GET /v0.1/ai/evaluations/{evaluation_id}`
+        (`docs/storage-query.md`): tenant-scoped lookup of the most recently
+        received event for `evaluation_id`. Mirrors
+        `factlama-reliability/storage/backend.py::StorageBackend.get_result`'s
+        contract exactly: returns `None` for a missing *or* cross-tenant
+        evaluation id -- "Queries must not expose existence across tenants;
+        inaccessible IDs return 404" (`docs/storage-query.md`) -- and `None`
+        again if `tenant` is authorized for the whole tenant but narrowed to
+        a different project/application than the one this evaluation
+        belongs to."""
         ...

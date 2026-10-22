@@ -9,11 +9,20 @@ pattern: `INSERT ... ON CONFLICT DO NOTHING RETURNING`, inside one
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from schemas.reliability_event import ReliabilityEvent
+from schemas.reliability_event import (
+    OverallVerdict,
+    QualificationStatusOrMixed,
+    ReliabilityEvent,
+    ResultStatus,
+    ScoreValue,
+    Usage,
+)
+from schemas.tenancy import TenantContext
 from storage.backend import TelemetryStore
 from storage.errors import StorageUnavailableError
 from storage.postgres.tables import reliability_events
@@ -53,6 +62,28 @@ def _event_to_row(event: ReliabilityEvent, received_at: datetime) -> dict[str, A
     }
 
 
+def _row_to_event(row: Any) -> ReliabilityEvent:
+    return ReliabilityEvent(
+        event_id=row.event_id,
+        tenant_id=row.tenant_id,
+        evaluation_id=row.evaluation_id,
+        project_id=row.project_id,
+        application_id=row.application_id,
+        interaction_id=row.interaction_id,
+        trace_id=row.trace_id,
+        span_id=row.span_id,
+        occurred_at=row.occurred_at.isoformat(),
+        status=ResultStatus(row.status),
+        verdict=OverallVerdict(row.verdict),
+        scores={name: ScoreValue.model_validate(value) for name, value in row.scores_json.items()},
+        evaluator_version=row.evaluator_version,
+        calibration_class=row.calibration_class,
+        calibration_classes=row.calibration_classes_json,
+        qualification_status=QualificationStatusOrMixed(row.qualification_status),
+        usage_summary=Usage.model_validate(row.usage_summary_json),
+    )
+
+
 class PostgresTelemetryStore(TelemetryStore):
     """See `storage.backend.TelemetryStore` for the contract this
     implements. Construct one instance per process, sharing one
@@ -77,3 +108,28 @@ class PostgresTelemetryStore(TelemetryStore):
                 f"could not record reliability event {event.event_id!r}: {exc}"
             ) from exc
         return inserted is not None
+
+    async def get_reliability_event(
+        self, tenant: TenantContext, evaluation_id: str
+    ) -> ReliabilityEvent | None:
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    select(reliability_events)
+                    .where(
+                        reliability_events.c.tenant_id == tenant.tenant_id,
+                        reliability_events.c.evaluation_id == evaluation_id,
+                    )
+                    # Multiple rows can share (tenant_id, evaluation_id) --
+                    # the PK is (tenant_id, event_id) -- so pick the most
+                    # recently received one, same recency rule a future
+                    # `supersedes` lineage would need anyway.
+                    .order_by(reliability_events.c.received_at.desc())
+                    .limit(1)
+                )
+            ).first()
+            if row is None:
+                return None
+            if not tenant.authorizes(row.project_id, row.application_id):
+                return None
+            return _row_to_event(row)

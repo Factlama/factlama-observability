@@ -27,11 +27,14 @@ class TenantContext(BaseModel):
         None, description="Authorized application scope, if narrowed"
     )
 
-    def authorizes(self, project_id: str, application_id: str) -> bool:
+    def authorizes(self, project_id: str | None, application_id: str | None) -> bool:
         """Whether a payload's project_id/application_id fall within what this
         context is authorized for. This is the "forged tenant fields ...
         fail safely" check from a typed context's perspective; it does not
         itself authenticate anything -- that is OBS-04's ingress boundary.
+        `None` arguments are real, not a caller error: a stored row's own
+        project_id/application_id columns are nullable (OBS-07's
+        `get_reliability_event`, `query/api/app.py`).
         """
         if self.project_id is not None and project_id != self.project_id:
             return False

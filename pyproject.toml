@@ -152,6 +152,20 @@ ignore_imports = [
 ]
 
 [[tool.importlinter.contracts]]
+# OBS-07, same rule as collector's own contract above: everything above the
+# storage layer depends on storage.backend's Protocol only, never the
+# concrete Postgres adapter -- query.api.bootstrap is the one
+# composition-root module allowed to construct it.
+name = "query must depend on storage.backend, not the concrete storage.postgres adapter"
+type = "forbidden"
+source_modules = ["query"]
+forbidden_modules = ["storage.postgres"]
+ignore_imports = [
+    "query.api.bootstrap -> storage.postgres.backend",
+    "query.api.bootstrap -> storage.postgres.engine",
+]
+
+[[tool.importlinter.contracts]]
 name = "storage.backend/errors are a pure protocol layer with no vendor imports"
 type = "forbidden"
 source_modules = ["storage.backend", "storage.errors"]
