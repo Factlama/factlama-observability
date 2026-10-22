@@ -112,24 +112,29 @@ class PostgresTelemetryStore(TelemetryStore):
     async def get_reliability_event(
         self, tenant: TenantContext, evaluation_id: str
     ) -> ReliabilityEvent | None:
-        async with self._engine.connect() as conn:
-            row = (
-                await conn.execute(
-                    select(reliability_events)
-                    .where(
-                        reliability_events.c.tenant_id == tenant.tenant_id,
-                        reliability_events.c.evaluation_id == evaluation_id,
+        try:
+            async with self._engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        select(reliability_events)
+                        .where(
+                            reliability_events.c.tenant_id == tenant.tenant_id,
+                            reliability_events.c.evaluation_id == evaluation_id,
+                        )
+                        # Multiple rows can share (tenant_id, evaluation_id) --
+                        # the PK is (tenant_id, event_id) -- so pick the most
+                        # recently received one, same recency rule a future
+                        # `supersedes` lineage would need anyway.
+                        .order_by(reliability_events.c.received_at.desc())
+                        .limit(1)
                     )
-                    # Multiple rows can share (tenant_id, evaluation_id) --
-                    # the PK is (tenant_id, event_id) -- so pick the most
-                    # recently received one, same recency rule a future
-                    # `supersedes` lineage would need anyway.
-                    .order_by(reliability_events.c.received_at.desc())
-                    .limit(1)
-                )
-            ).first()
-            if row is None:
-                return None
-            if not tenant.authorizes(row.project_id, row.application_id):
-                return None
-            return _row_to_event(row)
+                ).first()
+        except SQLAlchemyError as exc:
+            raise StorageUnavailableError(
+                f"could not read evaluation {evaluation_id!r}: {exc}"
+            ) from exc
+        if row is None:
+            return None
+        if not tenant.authorizes(row.project_id, row.application_id):
+            return None
+        return _row_to_event(row)

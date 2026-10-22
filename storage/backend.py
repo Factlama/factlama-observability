@@ -56,5 +56,10 @@ class TelemetryStore(Protocol):
         inaccessible IDs return 404" (`docs/storage-query.md`) -- and `None`
         again if `tenant` is authorized for the whole tenant but narrowed to
         a different project/application than the one this evaluation
-        belongs to."""
+        belongs to.
+
+        Raises `storage.errors.StorageUnavailableError` if the durable
+        store cannot be reached -- the caller (the query route) maps this
+        to a retryable 503, never an unhandled 500 (G6 failure acceptance:
+        "bounded storage-outage failures")."""
         ...

@@ -25,6 +25,7 @@ from query.api.errors import QueryError, QueryErrorCode
 from query.api.settings import Settings, get_settings
 from schemas.tenancy import TenantContext
 from storage.backend import TelemetryStore
+from storage.errors import StorageUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,12 @@ async def get_evaluation(
     tenant_context: Annotated[TenantContext, Depends(authenticate)],
     store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
 ) -> JSONResponse:
-    event = await store.get_reliability_event(tenant_context, evaluation_id)
+    try:
+        event = await store.get_reliability_event(tenant_context, evaluation_id)
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
     if event is None:
         raise QueryError(QueryErrorCode.NOT_FOUND, "evaluation not found")
     return JSONResponse(status_code=200, content=event.model_dump(mode="json", exclude_none=True))

@@ -21,6 +21,7 @@ from query.api.auth import TenantCredentialStore
 from query.api.settings import Settings, get_settings
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
+from storage.errors import StorageUnavailableError
 from tests.conformance.conftest import make_event
 
 TENANT_ONE_KEY = "tenant-one-key"
@@ -36,6 +37,7 @@ class FakeTelemetryStore:
 
     def __init__(self) -> None:
         self._events: dict[tuple[str, str], ReliabilityEvent] = {}
+        self.fail_next = False
 
     async def record_reliability_event(self, event: ReliabilityEvent) -> bool:
         key = (event.tenant_id, event.event_id)
@@ -47,6 +49,9 @@ class FakeTelemetryStore:
     async def get_reliability_event(
         self, tenant: TenantContext, evaluation_id: str
     ) -> ReliabilityEvent | None:
+        if self.fail_next:
+            self.fail_next = False
+            raise StorageUnavailableError("simulated storage outage")
         for event in self._events.values():
             if event.tenant_id != tenant.tenant_id or event.evaluation_id != evaluation_id:
                 continue
@@ -154,3 +159,20 @@ class TestEvaluationLookup:
         )
         response = _get(client, "eval-1", token=TENANT_ONE_SCOPED_KEY)
         assert response.status_code == 200
+
+
+class TestStorageOutage:
+    """G6 failure acceptance: "bounded storage-outage failures" -- a
+    durable-store read failure must surface as a retryable 503, never an
+    unhandled 500 (the same contract `tests/test_collector_ingress.py`'s
+    `TestStorageOutage` already proves for the write path)."""
+
+    def test_storage_failure_is_reported_as_dependency_unavailable(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        store.fail_next = True
+        response = _get(client, "eval-1", token=TENANT_ONE_KEY)
+        assert response.status_code == 503
+        body = response.json()
+        assert body["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        assert body["error"]["retryable"] is True
