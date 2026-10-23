@@ -8,6 +8,7 @@ translation itself with a minimal fake engine that raises the same bare
 `OSError` the real driver can, without needing Docker.
 """
 
+from datetime import datetime, timezone
 from types import TracebackType
 
 import pytest
@@ -55,3 +56,9 @@ async def test_record_reliability_event_translates_a_bare_connection_os_error() 
     store = PostgresTelemetryStore(_BrokenEngine())  # type: ignore[arg-type]
     with pytest.raises(StorageUnavailableError):
         await store.record_reliability_event(make_event())
+
+
+async def test_delete_reliability_events_translates_a_bare_connection_os_error() -> None:
+    store = PostgresTelemetryStore(_BrokenEngine())  # type: ignore[arg-type]
+    with pytest.raises(StorageUnavailableError):
+        await store.delete_reliability_events("tenant-a", before=datetime.now(timezone.utc))

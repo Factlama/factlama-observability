@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from asyncpg import PostgresError  # type: ignore[import-untyped]
-from sqlalchemy import literal, select, tuple_
+from sqlalchemy import delete, literal, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -236,6 +236,32 @@ class PostgresTelemetryStore(TelemetryStore):
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(f"could not aggregate reliability events: {exc}") from exc
         return _aggregate_rows(rows)
+
+    async def delete_reliability_events(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime,
+        project_id: str | None = None,
+        application_id: str | None = None,
+    ) -> int:
+        clauses: list[ColumnElement[bool]] = [
+            reliability_events.c.tenant_id == tenant_id,
+            reliability_events.c.received_at < before,
+        ]
+        if project_id is not None:
+            clauses.append(reliability_events.c.project_id == project_id)
+        if application_id is not None:
+            clauses.append(reliability_events.c.application_id == application_id)
+        stmt = delete(reliability_events).where(*clauses)
+        try:
+            async with self._engine.begin() as conn:
+                result = await conn.execute(stmt)
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(
+                f"could not delete reliability events for tenant {tenant_id!r}: {exc}"
+            ) from exc
+        return result.rowcount
 
 
 def _aggregate_rows(rows: Sequence[Any]) -> list[CalibrationClassAggregate]:

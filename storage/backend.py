@@ -103,3 +103,43 @@ class TelemetryStore(Protocol):
         Raises `storage.errors.StorageUnavailableError` on a durable-store
         failure, same as `get_reliability_event`."""
         ...
+
+    async def delete_reliability_events(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime,
+        project_id: str | None = None,
+        application_id: str | None = None,
+    ) -> int:
+        """OBS-06 stage-3 (2026-10-23, per explicit project-owner direction):
+        permanently deletes every event for `tenant_id` (optionally
+        narrowed to `project_id`/`application_id`) with `received_at
+        < before`. Returns the number of rows deleted.
+
+        `reliability_events` is currently this table's only durable store
+        for this data -- no separate spans/evaluation_links/aggregate
+        table exists yet to also delete from (OBS-06's own docstring), so
+        deleting here already covers "source and derived" for everything
+        this repo persists today; a future spans/links table extends this
+        method, not a second one.
+
+        Deliberately takes a raw `tenant_id`, not a `TenantContext`: this
+        is an administrative retention operation performed with full
+        authority over one tenant's data, not an authenticated end user's
+        scoped read -- `TenantContext.authorizes()` has no meaning here.
+
+        Deliberately has no default retention period and no caller yet:
+        `before` is always the caller's own explicit decision, never a
+        hardcoded constant -- `docs/storage-query.md`'s "Retention is per
+        tenant and data class" means the cutoff is a per-call choice, not
+        a repo-wide default. Building the sweep/cadence that would call
+        this on a schedule (a cron? an admin endpoint? a worker-loop
+        tick?) now would mean guessing at an operational choice with
+        nothing yet to validate it against -- the same deliberate-gap
+        precedent `factlama-reliability/storage/retention.py` already
+        established for its own tables.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
