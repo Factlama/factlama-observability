@@ -11,6 +11,7 @@ fixture-ingestion tests that never exercised a real producer/consumer
 boundary) in the sibling repo; this suite does not repeat it here.
 """
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from collector.ingress.app import app, get_storage_readiness, get_telemetry_store
 from collector.ingress.settings import Settings, get_settings
+from operations.concurrency import ConcurrencyLimiter
 from schemas.reliability_event import ReliabilityEvent
 from storage.errors import StorageUnavailableError
 
@@ -220,6 +222,47 @@ class TestMetrics:
             self._outcome_count(after, "UNAUTHENTICATED")
             == self._outcome_count(before, "UNAUTHENTICATED") + 1
         )
+
+
+class TestBackpressure:
+    """OBS-04 stage-3 (2026-10-23): bounded request concurrency -- a
+    request past the cap fails fast with a typed 503, never queues."""
+
+    def _saturate(self) -> ConcurrencyLimiter:
+        """Swaps in a 1-slot limiter and occupies it, simulating one
+        request already in flight. Caller must restore
+        `app.state.concurrency_limiter` afterward."""
+        original = app.state.concurrency_limiter
+        app.state.concurrency_limiter = ConcurrencyLimiter(max_concurrent=1)
+        entered = asyncio.run(app.state.concurrency_limiter.try_enter())
+        assert entered is True
+        return original
+
+    def test_rejects_once_the_limit_is_reached(self, client: TestClient) -> None:
+        original = self._saturate()
+        try:
+            response = _post(client, VALID_EVENT)
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        finally:
+            app.state.concurrency_limiter = original
+
+    def test_health_and_metrics_are_exempt_from_the_limit(self, client: TestClient) -> None:
+        original = self._saturate()
+        try:
+            assert client.get("/health/live").status_code == 200
+            assert client.get("/metrics").status_code == 200
+        finally:
+            app.state.concurrency_limiter = original
+
+    def test_exit_frees_the_slot_for_the_next_request(self, client: TestClient) -> None:
+        original = self._saturate()
+        try:
+            asyncio.run(app.state.concurrency_limiter.exit())
+            response = _post(client, VALID_EVENT)
+            assert response.status_code == 200
+        finally:
+            app.state.concurrency_limiter = original
 
 
 def _contracts_dir() -> Path | None:

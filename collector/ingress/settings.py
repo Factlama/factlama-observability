@@ -14,6 +14,14 @@ from operations.config import optional_env
 # this; it mirrors factlama-reliability's own DEFAULT_MAX_BODY_BYTES.
 DEFAULT_MAX_BODY_BYTES = 1_000_000
 
+# OBS-04 stage-3 (2026-10-23): bounded request concurrency
+# (LOW_LEVEL_IMPLEMENTATION.md's "Backpressure" rule). Sized above
+# storage/postgres/engine.py's own default `pool_size=10` -- enough
+# headroom that a request already past the concurrency gate is unlikely
+# to be the one that exhausts the DB pool, without being high enough to
+# let that same exhaustion happen anyway under real load.
+DEFAULT_MAX_CONCURRENT_REQUESTS = 20
+
 
 class Settings:
     """Process-wide ingress settings, read once from the environment."""
@@ -22,6 +30,9 @@ class Settings:
         self.workload_token = os.environ.get("FACTLAMA_RELIABILITY_WORKLOAD_TOKEN")
         self.max_body_bytes = int(
             optional_env("FACTLAMA_MAX_BODY_BYTES", str(DEFAULT_MAX_BODY_BYTES))
+        )
+        self.max_concurrent_requests = int(
+            optional_env("FACTLAMA_MAX_CONCURRENT_REQUESTS", str(DEFAULT_MAX_CONCURRENT_REQUESTS))
         )
         # Only `collector.ingress.bootstrap`'s lifespan consumes this, and it
         # is the one that enforces "must be set" (mirrors ADR-019 SS3's "fail

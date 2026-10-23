@@ -14,9 +14,10 @@ that model (`schemas/reliability_event.py`'s docstring).
 """
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter
 from pydantic import ValidationError
@@ -25,6 +26,7 @@ from collector.ingress.auth import authenticate_workload
 from collector.ingress.bootstrap import check_storage_ready, lifespan
 from collector.ingress.errors import IngressError, IngressErrorCode
 from collector.ingress.settings import Settings, get_settings
+from operations.concurrency import ConcurrencyLimiter
 from operations.metrics import install_metrics
 from schemas.reliability_event import ReliabilityEvent
 from storage.backend import TelemetryStore
@@ -43,11 +45,46 @@ _metrics_registry = install_metrics(app, build_version="0.1")
 # cannot see, on the same registry so one GET /metrics exposes both.
 INGRESS_EVENTS_TOTAL = Counter(
     "obs_ingress_events_total",
-    "Total ReliabilityEvent ingestion outcomes, by outcome "
-    "(accepted, duplicate, rejected, storage_unavailable).",
+    "Total ReliabilityEvent ingestion outcomes, by outcome -- the IngressErrorCode "
+    "value for a rejection, or 'accepted'/'duplicate' for a successful write.",
     ["outcome"],
     registry=_metrics_registry,
 )
+
+# OBS-04 stage-3 (2026-10-23): bounded request concurrency
+# (LOW_LEVEL_IMPLEMENTATION.md's "Backpressure" rule). A plain module-level
+# object, like the counters above -- tests reach in and swap it directly
+# (`tests/test_collector_ingress.py::TestBackpressure`), the same way other
+# tests swap `app.dependency_overrides`, since a middleware (unlike a
+# route's own `Depends`) cannot be overridden through FastAPI's dependency
+# injection.
+app.state.concurrency_limiter = ConcurrencyLimiter(get_settings().max_concurrent_requests)
+
+_EXEMPT_FROM_CONCURRENCY_LIMIT = frozenset({"/health/live", "/health/ready", "/metrics"})
+
+
+@app.middleware("http")
+async def _enforce_concurrency_limit(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Rejects with a typed 503 the instant the in-flight cap is reached --
+    never queues a request past it, which is the one behavior
+    `asyncio.Semaphore.acquire()` cannot give (it blocks instead of
+    failing fast)."""
+    if request.url.path in _EXEMPT_FROM_CONCURRENCY_LIMIT:
+        return await call_next(request)
+    limiter: ConcurrencyLimiter = request.app.state.concurrency_limiter
+    if not await limiter.try_enter():
+        error = IngressError(
+            IngressErrorCode.DEPENDENCY_UNAVAILABLE,
+            "too many concurrent requests; retry shortly",
+        )
+        INGRESS_EVENTS_TOTAL.labels(outcome=error.code.value).inc()
+        return JSONResponse(status_code=error.status_code, content=error.to_body())
+    try:
+        return await call_next(request)
+    finally:
+        await limiter.exit()
 
 
 def get_telemetry_store(request: Request) -> TelemetryStore:
