@@ -157,8 +157,15 @@ async def list_evaluations(
     return JSONResponse(
         status_code=200,
         content={
+            # LOW_LEVEL_IMPLEMENTATION.md: "Response envelopes: list
+            # {schema_version,items,next_cursor,window,as_of}" -- every
+            # other response in this system already carries
+            # schema_version; this route had been the one exception.
+            "schema_version": "0.1",
             "items": [event.model_dump(mode="json", exclude_none=True) for event in page.items],
             "next_cursor": page.next_cursor,
+            "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
+            "as_of": datetime.now(timezone.utc).isoformat(),
         },
     )
 
@@ -187,36 +194,47 @@ async def get_evaluation_aggregates(
     return JSONResponse(
         status_code=200,
         content={
-            "since": since_dt.isoformat(),
-            "until": until_dt.isoformat(),
-            "classes": [
-                {
-                    "calibration_class": agg.calibration_class,
-                    "count": agg.count,
-                    "cost_by_currency": [
-                        {
-                            "currency": cost.currency,
-                            "amount": cost.amount,
-                            "measured_count": cost.measured_count,
-                            "pricing_versions": cost.pricing_versions,
-                        }
-                        for cost in agg.cost_by_currency
-                    ],
-                    "cost_unavailable_count": agg.cost_unavailable_count,
-                    "cost_coverage_complete": agg.cost_coverage_complete,
-                    "scores": [
-                        {
-                            "score_name": score.score_name,
-                            "measured_count": score.measured_count,
-                            "average": score.average,
-                            "not_applicable_count": score.not_applicable_count,
-                            "unavailable_count": score.unavailable_count,
-                        }
-                        for score in agg.scores
-                    ],
-                }
-                for agg in aggregates
-            ],
+            # LOW_LEVEL_IMPLEMENTATION.md: "aggregate
+            # {schema_version,window,as_of,filters,sample_count,metrics}" --
+            # sample_count is the total events this aggregate covers, the
+            # one number a caller needs before trusting any rate/average
+            # computed from "metrics" below (storage-query.md: "Aggregate
+            # responses include window, sample count, units...").
+            "schema_version": "0.1",
+            "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "filters": {},
+            "sample_count": sum(agg.count for agg in aggregates),
+            "metrics": {
+                "calibration_classes": [
+                    {
+                        "calibration_class": agg.calibration_class,
+                        "count": agg.count,
+                        "cost_by_currency": [
+                            {
+                                "currency": cost.currency,
+                                "amount": cost.amount,
+                                "measured_count": cost.measured_count,
+                                "pricing_versions": cost.pricing_versions,
+                            }
+                            for cost in agg.cost_by_currency
+                        ],
+                        "cost_unavailable_count": agg.cost_unavailable_count,
+                        "cost_coverage_complete": agg.cost_coverage_complete,
+                        "scores": [
+                            {
+                                "score_name": score.score_name,
+                                "measured_count": score.measured_count,
+                                "average": score.average,
+                                "not_applicable_count": score.not_applicable_count,
+                                "unavailable_count": score.unavailable_count,
+                            }
+                            for score in agg.scores
+                        ],
+                    }
+                    for agg in aggregates
+                ]
+            },
         },
     )
 

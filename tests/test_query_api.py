@@ -278,14 +278,19 @@ class TestListEvaluations:
     def test_missing_auth_is_rejected(self, client: TestClient) -> None:
         assert _list(client, token=None).status_code == 401
 
-    def test_returns_items_and_next_cursor_shape(
+    def test_returns_the_documented_envelope_shape(
         self, client: TestClient, store: FakeTelemetryStore
     ) -> None:
+        """LOW_LEVEL_IMPLEMENTATION.md: "list
+        {schema_version,items,next_cursor,window,as_of}"."""
         _seed(store, make_event(tenant_id="tenant-one", event_id="e1", evaluation_id="eval-1"))
         response = _list(client, token=TENANT_ONE_KEY)
         assert response.status_code == 200
         body = response.json()
-        assert "items" in body and "next_cursor" in body
+        assert body["schema_version"] == "0.1"
+        assert "next_cursor" in body
+        assert "since" in body["window"] and "until" in body["window"]
+        assert "as_of" in body
         assert [item["event_id"] for item in body["items"]] == ["e1"]
 
     def test_cross_tenant_isolation(self, client: TestClient, store: FakeTelemetryStore) -> None:
@@ -342,9 +347,13 @@ class TestEvaluationAggregates:
     def test_missing_auth_is_rejected(self, client: TestClient) -> None:
         assert _aggregates(client, token=None).status_code == 401
 
-    def test_returns_classes_and_window_shape(
+    def test_returns_the_documented_envelope_shape(
         self, client: TestClient, store: FakeTelemetryStore
     ) -> None:
+        """LOW_LEVEL_IMPLEMENTATION.md: "aggregate
+        {schema_version,window,as_of,filters,sample_count,metrics}" --
+        every other response in this system carries schema_version; this
+        route should not be the exception."""
         _seed(
             store,
             make_event(tenant_id="tenant-one", event_id="e1", calibration_class="class-a"),
@@ -352,8 +361,11 @@ class TestEvaluationAggregates:
         response = _aggregates(client, token=TENANT_ONE_KEY)
         assert response.status_code == 200
         body = response.json()
-        assert "since" in body and "until" in body
-        assert body["classes"] == [
+        assert body["schema_version"] == "0.1"
+        assert "since" in body["window"] and "until" in body["window"]
+        assert "as_of" in body
+        assert body["sample_count"] == 1
+        assert body["metrics"]["calibration_classes"] == [
             {
                 "calibration_class": "class-a",
                 "count": 1,
@@ -368,7 +380,9 @@ class TestEvaluationAggregates:
         _seed(store, make_event(tenant_id="tenant-one", event_id="e1"))
         response = _aggregates(client, token=TENANT_TWO_KEY)
         assert response.status_code == 200
-        assert response.json()["classes"] == []
+        body = response.json()
+        assert body["metrics"]["calibration_classes"] == []
+        assert body["sample_count"] == 0
 
     def test_rejects_since_after_until(self, client: TestClient) -> None:
         response = _aggregates(
@@ -395,5 +409,5 @@ class TestEvaluationAggregates:
         with `evaluation_id="aggregates"`."""
         response = _aggregates(client, token=TENANT_ONE_KEY)
         assert response.status_code == 200
-        assert "classes" in response.json()
+        assert "metrics" in response.json()
         assert "evaluation_id" not in response.json()
