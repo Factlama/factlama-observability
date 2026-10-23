@@ -88,6 +88,9 @@ def _test_settings() -> Settings:
             TENANT_ONE_KEY: TenantContext(tenant_id="tenant-one"),
             TENANT_ONE_SCOPED_KEY: TenantContext(tenant_id="tenant-one", project_id="proj-a"),
             TENANT_TWO_KEY: TenantContext(tenant_id="tenant-two"),
+            "app-scoped-key": TenantContext(
+                tenant_id="tenant-one", project_id="proj-a", application_id="app-a"
+            ),
         }
     )
     settings.database_url = None
@@ -176,3 +179,12 @@ class TestStorageOutage:
         body = response.json()
         assert body["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
         assert body["error"]["retryable"] is True
+
+
+@pytest.mark.parametrize("application_id, expected", [("app-a", 200), ("app-b", 404)])
+def test_application_scoped_credential(
+    client: TestClient, store: FakeTelemetryStore, application_id: str, expected: int
+) -> None:
+    event = make_event(tenant_id="tenant-one", evaluation_id="app-eval", project_id="proj-a")
+    _seed(store, event.model_copy(update={"application_id": application_id}))
+    assert _get(client, "app-eval", token="app-scoped-key").status_code == expected

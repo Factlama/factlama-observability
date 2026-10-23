@@ -4,11 +4,21 @@ implementation for OBS-06, mirroring
 pattern: `INSERT ... ON CONFLICT DO NOTHING RETURNING`, inside one
 `AsyncEngine.begin()` transaction, atomically wins or loses the
 `(tenant_id, event_id)` dedup race without a separate read-then-write step.
+
+Both storage methods catch driver `PostgresError` and `OSError` alongside
+`SQLAlchemyError`: a connection
+dropped mid-query (e.g. the database process stopping) can surface as a bare
+asyncpg/transport `OSError` that SQLAlchemy does not always wrap in a
+`SQLAlchemyError` subclass -- a real outage reproduction found this
+(P2, `review-evidence/g6-2026-10-22/REVIEW.md`), where catching only
+`SQLAlchemyError` let the failure escape as an unhandled 500 instead of the
+contracted retryable 503.
 """
 
 from datetime import datetime, timezone
 from typing import Any
 
+from asyncpg import PostgresError  # type: ignore[import-untyped]
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
@@ -103,7 +113,7 @@ class PostgresTelemetryStore(TelemetryStore):
         try:
             async with self._engine.begin() as conn:
                 inserted = (await conn.execute(stmt)).first()
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not record reliability event {event.event_id!r}: {exc}"
             ) from exc
@@ -129,7 +139,7 @@ class PostgresTelemetryStore(TelemetryStore):
                         .limit(1)
                     )
                 ).first()
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not read evaluation {evaluation_id!r}: {exc}"
             ) from exc

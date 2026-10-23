@@ -144,3 +144,16 @@ class TestGetReliabilityEvent:
         event = await store.get_reliability_event(TenantContext(tenant_id="tenant-a"), "eval-1")
         assert event is not None
         assert event.event_id == "event-2"
+
+
+async def test_application_scope_filters_evaluations(store: PostgresTelemetryStore) -> None:
+    event = make_event(tenant_id="tenant-a", evaluation_id="app-scope").model_copy(
+        update={"project_id": "project-a", "application_id": "app-a"}
+    )
+    await store.record_reliability_event(event)
+    for application_id, allowed in [("app-a", True), ("app-b", False)]:
+        tenant = TenantContext(
+            tenant_id="tenant-a", project_id="project-a", application_id=application_id
+        )
+        result = await store.get_reliability_event(tenant, "app-scope")
+        assert (result is not None) is allowed
