@@ -24,6 +24,7 @@ from schemas.reliability_event import (
     QualificationStatusOrMixed,
     ReliabilityEvent,
     ResultStatus,
+    ScoreValue,
     Usage,
 )
 from storage.postgres.backend import PostgresTelemetryStore
@@ -67,6 +68,10 @@ def make_event(
     evaluation_id: str = "eval-1",
     project_id: str | None = None,
     application_id: str | None = None,
+    calibration_class: str = "class-1",
+    scores: dict[str, ScoreValue] | None = None,
+    usage_summary: Usage | None = None,
+    occurred_at: str | None = None,
 ) -> ReliabilityEvent:
     return ReliabilityEvent(
         event_id=event_id,
@@ -74,12 +79,12 @@ def make_event(
         evaluation_id=evaluation_id,
         project_id=project_id,
         application_id=application_id,
-        occurred_at=datetime.now(timezone.utc).isoformat(),
+        occurred_at=occurred_at or datetime.now(timezone.utc).isoformat(),
         status=ResultStatus.COMPLETED,
         verdict=OverallVerdict.PASS,
-        scores={},
+        scores=scores or {},
         evaluator_version="0.0.0",
-        calibration_class="class-1",
+        calibration_class=calibration_class,
         qualification_status=QualificationStatusOrMixed.QUALIFIED,
-        usage_summary=Usage(),
+        usage_summary=usage_summary or Usage(),
     )

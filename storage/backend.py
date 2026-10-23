@@ -18,10 +18,12 @@ driver-specific exception -- failures are one of `storage.errors`'s typed
 exceptions.
 """
 
+from datetime import datetime
 from typing import Protocol
 
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
+from storage.aggregates import CalibrationClassAggregate, EventPage
 
 
 class TelemetryStore(Protocol):
@@ -62,4 +64,42 @@ class TelemetryStore(Protocol):
         store cannot be reached -- the caller (the query route) maps this
         to a retryable 503, never an unhandled 500 (G6 failure acceptance:
         "bounded storage-outage failures")."""
+        ...
+
+    async def list_reliability_events(
+        self,
+        tenant: TenantContext,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        cursor: str | None = None,
+    ) -> EventPage:
+        """OBS-07 stage-3 (2026-10-23): a bounded, tenant/project/application
+        -scoped page of events whose `received_at` falls in `[since, until]`,
+        newest first. `limit` is the caller's already-validated, bounded page
+        size (`query/api/app.py` enforces the max before calling this).
+        `cursor`, when given, is an opaque value from a previous page's
+        `EventPage.next_cursor` -- never a client-constructed offset, so
+        concurrent inserts/deletes cannot skip or duplicate rows the way an
+        offset-based page could.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as `get_reliability_event`."""
+        ...
+
+    async def aggregate_reliability_events(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> list[CalibrationClassAggregate]:
+        """OBS-07/14 stage-3 (2026-10-23): calibration-class-grouped score
+        and cost aggregates over `[since, until]`, scoped the same way
+        `list_reliability_events` is. Each event contributes to exactly one
+        class's aggregate -- `(tenant_id, event_id)` is this table's primary
+        key, so a redelivered duplicate is already one row before this
+        method ever runs, not something it must itself deduplicate.
+        `MIXED` is one more class among the returned entries, never merged
+        into the classes `calibration_classes` names.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as `get_reliability_event`."""
         ...

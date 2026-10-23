@@ -15,6 +15,7 @@ internal ingestion path.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, Request
@@ -30,6 +31,15 @@ from storage.errors import StorageUnavailableError
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FactLama Observability Query API", version="0.1", lifespan=lifespan)
+
+# OBS-07 stage-3 (2026-10-23): bounded page size and bounded time window --
+# "bounded time filters and stable ... pagination" is this slice's own
+# deliverable, so neither is allowed to be caller-controlled without limit
+# (docs/storage-query.md's "bounded" requirement for exactly this route
+# shape).
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 200
+MAX_TIME_WINDOW = timedelta(days=90)
 
 
 def get_telemetry_store(request: Request) -> TelemetryStore:
@@ -88,6 +98,127 @@ async def health_ready(
     if not storage_ready:
         return JSONResponse(status_code=503, content={"status": "unavailable"})
     return JSONResponse(status_code=200, content={"status": "ok"})
+
+
+def _parse_timestamp(raw: str, field_name: str) -> datetime:
+    try:
+        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise QueryError(
+            QueryErrorCode.INVALID_ARGUMENT,
+            f"{field_name} is not a valid ISO 8601 timestamp: {raw!r}",
+        ) from exc
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _resolve_window(since: str | None, until: str | None) -> tuple[datetime, datetime]:
+    """Defaults `until` to now and `since` to `until - MAX_TIME_WINDOW` --
+    every call is bounded even when the caller passes neither parameter,
+    never an unbounded full-table scan by omission."""
+    until_dt = _parse_timestamp(until, "until") if until else datetime.now(timezone.utc)
+    since_dt = _parse_timestamp(since, "since") if since else until_dt - MAX_TIME_WINDOW
+    if since_dt > until_dt:
+        raise QueryError(QueryErrorCode.INVALID_ARGUMENT, "since must not be after until")
+    if until_dt - since_dt > MAX_TIME_WINDOW:
+        raise QueryError(
+            QueryErrorCode.INVALID_ARGUMENT,
+            f"the time window (since to until) must not exceed {MAX_TIME_WINDOW}",
+        )
+    return since_dt, until_dt
+
+
+@app.get("/v0.1/ai/evaluations")
+async def list_evaluations(
+    tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+    cursor: str | None = None,
+) -> JSONResponse:
+    """OBS-07 stage-3: evaluation listing using only existing
+    `ReliabilityEvent` data -- no trace/span fields, per ADR-021's
+    independent-slice scoping."""
+    if not (1 <= limit <= MAX_LIST_LIMIT):
+        raise QueryError(
+            QueryErrorCode.INVALID_ARGUMENT, f"limit must be between 1 and {MAX_LIST_LIMIT}"
+        )
+    since_dt, until_dt = _resolve_window(since, until)
+    try:
+        page = await store.list_reliability_events(
+            tenant_context, since=since_dt, until=until_dt, limit=limit, cursor=cursor
+        )
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+    except ValueError as exc:
+        raise QueryError(QueryErrorCode.INVALID_ARGUMENT, "cursor is invalid") from exc
+    return JSONResponse(
+        status_code=200,
+        content={
+            "items": [event.model_dump(mode="json", exclude_none=True) for event in page.items],
+            "next_cursor": page.next_cursor,
+        },
+    )
+
+
+@app.get("/v0.1/ai/evaluations/aggregates")
+async def get_evaluation_aggregates(
+    tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+    since: str | None = None,
+    until: str | None = None,
+) -> JSONResponse:
+    """OBS-07/14 stage-3: score/cost aggregates grouped by calibration
+    class, using only existing `ReliabilityEvent` data. Registered before
+    `/v0.1/ai/evaluations/{evaluation_id}` below -- otherwise "aggregates"
+    would be captured as a path-matched evaluation_id instead of reaching
+    this route."""
+    since_dt, until_dt = _resolve_window(since, until)
+    try:
+        aggregates = await store.aggregate_reliability_events(
+            tenant_context, since=since_dt, until=until_dt
+        )
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+    return JSONResponse(
+        status_code=200,
+        content={
+            "since": since_dt.isoformat(),
+            "until": until_dt.isoformat(),
+            "classes": [
+                {
+                    "calibration_class": agg.calibration_class,
+                    "count": agg.count,
+                    "cost_by_currency": [
+                        {
+                            "currency": cost.currency,
+                            "amount": cost.amount,
+                            "measured_count": cost.measured_count,
+                            "pricing_versions": cost.pricing_versions,
+                        }
+                        for cost in agg.cost_by_currency
+                    ],
+                    "cost_unavailable_count": agg.cost_unavailable_count,
+                    "cost_coverage_complete": agg.cost_coverage_complete,
+                    "scores": [
+                        {
+                            "score_name": score.score_name,
+                            "measured_count": score.measured_count,
+                            "average": score.average,
+                            "not_applicable_count": score.not_applicable_count,
+                            "unavailable_count": score.unavailable_count,
+                        }
+                        for score in agg.scores
+                    ],
+                }
+                for agg in aggregates
+            ],
+        },
+    )
 
 
 @app.get("/v0.1/ai/evaluations/{evaluation_id}")
