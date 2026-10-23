@@ -44,6 +44,12 @@ dev = [
     "fastapi>=0.109.0",
     "uvicorn>=0.27.0",
     "httpx>=0.27.0",
+    # OBS-11 (2026-10-23 G6 stage 3): self-observability metrics for both
+    # HTTP services, exposed Prometheus-text at GET /metrics -- a pure-Python
+    # dependency with no transitive risk, and the de facto standard this
+    # project's own OBS-10 ("Prometheus-compatible metrics where
+    # appropriate") already names.
+    "prometheus-client>=0.20.0",
     # OBS-06's storage conformance suite must run against a real database
     # instance, not mocks (same rule as factlama-reliability's ADR-019 SS4).
     # testcontainers launches/tears down a throwaway Postgres via the local
@@ -53,6 +59,7 @@ dev = [
 api = [
     "fastapi>=0.109.0",
     "uvicorn>=0.27.0",
+    "prometheus-client>=0.20.0",
 ]
 
 [tool.hatch.build.targets.wheel]

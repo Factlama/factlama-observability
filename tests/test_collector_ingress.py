@@ -171,6 +171,57 @@ class TestStorageOutage:
         assert body["error"]["retryable"] is True
 
 
+class TestMetrics:
+    """OBS-11 stage-3: `operations.metrics.install_metrics`'s own logic is
+    tested in `tests/test_metrics.py`; this only proves this app actually
+    wires it, and that the business-level outcome (accepted/duplicate/
+    rejected) `operations.metrics`'s generic HTTP-status middleware cannot
+    see on its own gets recorded here."""
+
+    def test_metrics_endpoint_exists(self, client: TestClient) -> None:
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+
+    @staticmethod
+    def _outcome_count(body: str, outcome: str) -> float:
+        needle = f'obs_ingress_events_total{{outcome="{outcome}"}} '
+        for line in body.splitlines():
+            if line.startswith(needle):
+                return float(line.rsplit(" ", 1)[1])
+        return 0.0
+
+    def test_accepted_duplicate_and_rejected_are_counted_separately(
+        self, client: TestClient
+    ) -> None:
+        # The underlying app (and so this counter) is a module-level
+        # singleton shared by every test in this file -- assert on the
+        # delta this test itself causes, never an absolute value.
+        before = client.get("/metrics").text
+
+        client.post(
+            "/internal/v0.1/reliability-events",
+            json=VALID_EVENT,
+            headers={"Authorization": f"Bearer {WORKLOAD_TOKEN}"},
+        )
+        client.post(
+            "/internal/v0.1/reliability-events",
+            json=VALID_EVENT,
+            headers={"Authorization": f"Bearer {WORKLOAD_TOKEN}"},
+        )
+        client.post("/internal/v0.1/reliability-events", json=VALID_EVENT)  # no auth -> rejected
+
+        after = client.get("/metrics").text
+        assert self._outcome_count(after, "accepted") == self._outcome_count(before, "accepted") + 1
+        assert (
+            self._outcome_count(after, "duplicate") == self._outcome_count(before, "duplicate") + 1
+        )
+        assert (
+            self._outcome_count(after, "UNAUTHENTICATED")
+            == self._outcome_count(before, "UNAUTHENTICATED") + 1
+        )
+
+
 def _contracts_dir() -> Path | None:
     """Same locator as `test_contract_fixtures.py`: an explicit env var (set
     by CI) or the local three-repo workspace layout."""

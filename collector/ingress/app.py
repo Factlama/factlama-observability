@@ -18,12 +18,14 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
+from prometheus_client import Counter
 from pydantic import ValidationError
 
 from collector.ingress.auth import authenticate_workload
 from collector.ingress.bootstrap import check_storage_ready, lifespan
 from collector.ingress.errors import IngressError, IngressErrorCode
 from collector.ingress.settings import Settings, get_settings
+from operations.metrics import install_metrics
 from schemas.reliability_event import ReliabilityEvent
 from storage.backend import TelemetryStore
 from storage.errors import StorageUnavailableError
@@ -31,6 +33,21 @@ from storage.errors import StorageUnavailableError
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FactLama Observability Collector", version="0.1", lifespan=lifespan)
+_metrics_registry = install_metrics(app, build_version="0.1")
+
+# OBS-11 stage-3 (2026-10-23): the generic obs_http_requests_total
+# middleware (operations/metrics.py) only sees an HTTP status code, which
+# cannot distinguish "accepted" from "duplicate" -- both return 200 per
+# docs/collector.md's "returns success for replay" rule. This counter
+# records the business-level outcome `install_metrics`'s middleware
+# cannot see, on the same registry so one GET /metrics exposes both.
+INGRESS_EVENTS_TOTAL = Counter(
+    "obs_ingress_events_total",
+    "Total ReliabilityEvent ingestion outcomes, by outcome "
+    "(accepted, duplicate, rejected, storage_unavailable).",
+    ["outcome"],
+    registry=_metrics_registry,
+)
 
 
 def get_telemetry_store(request: Request) -> TelemetryStore:
@@ -44,11 +61,19 @@ def get_telemetry_store(request: Request) -> TelemetryStore:
 async def get_storage_readiness(request: Request) -> bool:
     """A live check, not just "did startup succeed once" -- overridden
     directly in tests for the same reason as `get_telemetry_store`."""
-    return await check_storage_ready(request.app)
+    ready = await check_storage_ready(request.app)
+    request.app.state.record_storage_readiness(ready)
+    return ready
 
 
 @app.exception_handler(IngressError)
 async def handle_ingress_error(_: Request, exc: IngressError) -> JSONResponse:
+    # Labeled by the error's own code, not a flat "rejected" -- cardinality
+    # is bounded by IngressErrorCode's small fixed enum, and this is the one
+    # place every IngressError (auth, size, validation, storage failure)
+    # passes through exactly once, so there is no separate counter in
+    # receive_reliability_event to double-count a storage failure against.
+    INGRESS_EVENTS_TOTAL.labels(outcome=exc.code.value).inc()
     return JSONResponse(status_code=exc.status_code, content=exc.to_body())
 
 
@@ -158,6 +183,7 @@ async def receive_reliability_event(
             "durable storage is temporarily unavailable",
         ) from exc
 
+    INGRESS_EVENTS_TOTAL.labels(outcome="accepted" if newly_inserted else "duplicate").inc()
     response_body: dict[str, Any] = {
         "schema_version": "0.1",
         "event_id": event.event_id,

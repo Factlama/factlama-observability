@@ -21,6 +21,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 
+from operations.metrics import install_metrics
 from query.api.bootstrap import check_storage_ready, lifespan
 from query.api.errors import QueryError, QueryErrorCode
 from query.api.settings import Settings, get_settings
@@ -31,6 +32,7 @@ from storage.errors import StorageUnavailableError
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FactLama Observability Query API", version="0.1", lifespan=lifespan)
+install_metrics(app, build_version="0.1")
 
 # OBS-07 stage-3 (2026-10-23): bounded page size and bounded time window --
 # "bounded time filters and stable ... pagination" is this slice's own
@@ -53,7 +55,9 @@ def get_telemetry_store(request: Request) -> TelemetryStore:
 async def get_storage_readiness(request: Request) -> bool:
     """A live check, not just "did startup succeed once" -- overridden
     directly in tests for the same reason as `get_telemetry_store`."""
-    return await check_storage_ready(request.app)
+    ready = await check_storage_ready(request.app)
+    request.app.state.record_storage_readiness(ready)
+    return ready
 
 
 def _extract_bearer_token(authorization: str | None) -> str | None:

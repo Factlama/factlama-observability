@@ -411,3 +411,30 @@ class TestEvaluationAggregates:
         assert response.status_code == 200
         assert "metrics" in response.json()
         assert "evaluation_id" not in response.json()
+
+
+class TestMetrics:
+    """OBS-11 stage-3: `operations.metrics.install_metrics`'s own logic is
+    tested in `tests/test_metrics.py`; this only proves this app wires it."""
+
+    def test_metrics_endpoint_exists(self, client: TestClient) -> None:
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+
+    def test_request_count_increases_for_a_known_route(self, client: TestClient) -> None:
+        def _count(body: str) -> float:
+            needles = [
+                'route="/v0.1/ai/evaluations/{evaluation_id}"',
+                'method="GET"',
+                'status_code="404"',
+            ]
+            for line in body.splitlines():
+                if line.startswith("obs_http_requests_total{") and all(n in line for n in needles):
+                    return float(line.rsplit(" ", 1)[1])
+            return 0.0
+
+        before = _count(client.get("/metrics").text)
+        _get(client, "no-such-eval", token=TENANT_ONE_KEY)
+        after = _count(client.get("/metrics").text)
+        assert after == before + 1
