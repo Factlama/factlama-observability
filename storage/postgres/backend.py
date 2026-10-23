@@ -15,7 +15,6 @@ asyncpg/transport `OSError` that SQLAlchemy does not always wrap in a
 contracted retryable 503.
 """
 
-import base64
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -38,7 +37,7 @@ from schemas.reliability_event import (
 from schemas.tenancy import TenantContext
 from storage.aggregates import (
     CalibrationClassAggregate,
-    CurrencyCost,
+    CostBucket,
     EventPage,
     ScoreAggregate,
 )
@@ -117,17 +116,6 @@ def _tenant_scope_clauses(tenant: TenantContext) -> list[ColumnElement[bool]]:
     return clauses
 
 
-def _encode_cursor(received_at: datetime, event_id: str) -> str:
-    raw = f"{received_at.isoformat()}|{event_id}".encode()
-    return base64.urlsafe_b64encode(raw).decode("ascii")
-
-
-def _decode_cursor(cursor: str) -> tuple[datetime, str]:
-    raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode()
-    received_at_raw, _, event_id = raw.partition("|")
-    return datetime.fromisoformat(received_at_raw), event_id
-
-
 class PostgresTelemetryStore(TelemetryStore):
     """See `storage.backend.TelemetryStore` for the contract this
     implements. Construct one instance per process, sharing one
@@ -190,21 +178,24 @@ class PostgresTelemetryStore(TelemetryStore):
         since: datetime,
         until: datetime,
         limit: int,
-        cursor: str | None = None,
+        after: tuple[datetime, str] | None = None,
     ) -> EventPage:
         clauses = _tenant_scope_clauses(tenant)
-        clauses.append(reliability_events.c.received_at >= since)
-        clauses.append(reliability_events.c.received_at <= until)
-        if cursor is not None:
-            cursor_received_at, cursor_event_id = _decode_cursor(cursor)
+        # Half-open [since, until): ADR-021's "adjacent windows do not
+        # overlap" -- occurred_at == until belongs to the *next* window,
+        # not this one.
+        clauses.append(reliability_events.c.occurred_at >= since)
+        clauses.append(reliability_events.c.occurred_at < until)
+        if after is not None:
+            after_occurred_at, after_event_id = after
             clauses.append(
-                tuple_(reliability_events.c.received_at, reliability_events.c.event_id)
-                < tuple_(literal(cursor_received_at), literal(cursor_event_id))
+                tuple_(reliability_events.c.occurred_at, reliability_events.c.event_id)
+                < tuple_(literal(after_occurred_at), literal(after_event_id))
             )
         stmt = (
             select(reliability_events)
             .where(*clauses)
-            .order_by(reliability_events.c.received_at.desc(), reliability_events.c.event_id.desc())
+            .order_by(reliability_events.c.occurred_at.desc(), reliability_events.c.event_id.desc())
             # One extra row: its presence alone tells us whether a next page
             # exists, without a separate COUNT query.
             .limit(limit + 1)
@@ -216,19 +207,22 @@ class PostgresTelemetryStore(TelemetryStore):
             raise StorageUnavailableError(f"could not list reliability events: {exc}") from exc
         has_more = len(rows) > limit
         page_rows = rows[:limit]
-        next_cursor = (
-            _encode_cursor(page_rows[-1].received_at, page_rows[-1].event_id)
-            if has_more and page_rows
-            else None
+        next_position = (
+            (page_rows[-1].occurred_at, page_rows[-1].event_id) if has_more and page_rows else None
         )
-        return EventPage(items=[_row_to_event(row) for row in page_rows], next_cursor=next_cursor)
+        return EventPage(
+            items=[_row_to_event(row) for row in page_rows], next_position=next_position
+        )
 
     async def aggregate_reliability_events(
         self, tenant: TenantContext, *, since: datetime, until: datetime
     ) -> list[CalibrationClassAggregate]:
         clauses = _tenant_scope_clauses(tenant)
-        clauses.append(reliability_events.c.received_at >= since)
-        clauses.append(reliability_events.c.received_at <= until)
+        # Event time, not receipt time (ADR-021: "Evaluation aggregate
+        # windows use occurred_at, not received_at"), half-open for the
+        # same adjacent-window reason as list_reliability_events above.
+        clauses.append(reliability_events.c.occurred_at >= since)
+        clauses.append(reliability_events.c.occurred_at < until)
         stmt = select(reliability_events).where(*clauses)
         try:
             async with self._engine.connect() as conn:
@@ -282,7 +276,13 @@ def _aggregate_rows(rows: Sequence[Any]) -> list[CalibrationClassAggregate]:
 
 
 def _aggregate_one_class(calibration_class: str, rows: Sequence[Any]) -> CalibrationClassAggregate:
-    cost_totals: dict[str, dict[str, Any]] = {}
+    # Keyed by (currency, pricing_version) -- ADR-021: "Group cost by the
+    # tuple (currency, pricing source, pricing version) ... a list of
+    # versions beside one pooled amount is not separate grouping."
+    # `pricing_version=None` is itself a distinct key (an explicit
+    # "measured but no recorded pricing-version provenance" bucket), never
+    # merged into a specific version's total for the same currency.
+    cost_totals: dict[tuple[str, str | None], dict[str, Any]] = {}
     cost_unavailable_count = 0
     for row in rows:
         cost = row.usage_summary_json.get("cost") or {}
@@ -291,14 +291,10 @@ def _aggregate_one_class(calibration_class: str, rows: Sequence[Any]) -> Calibra
             and cost.get("currency")
             and cost.get("amount") is not None
         ):
-            bucket = cost_totals.setdefault(
-                cost["currency"],
-                {"amount": 0.0, "measured_count": 0, "pricing_versions": set()},
-            )
+            key = (cost["currency"], cost.get("pricing_version"))
+            bucket = cost_totals.setdefault(key, {"amount": 0.0, "measured_count": 0})
             bucket["amount"] += float(cost["amount"])
             bucket["measured_count"] += 1
-            if cost.get("pricing_version"):
-                bucket["pricing_versions"].add(cost["pricing_version"])
         else:
             # Missing/UNAVAILABLE cost is never treated as zero and never
             # silently excluded from the class's own count -- it is its own
@@ -306,14 +302,20 @@ def _aggregate_one_class(calibration_class: str, rows: Sequence[Any]) -> Calibra
             # cost nothing" apart from "we don't know what this class cost."
             cost_unavailable_count += 1
 
-    cost_by_currency = [
-        CurrencyCost(
+    cost_buckets = [
+        CostBucket(
             currency=currency,
+            pricing_version=pricing_version,
             amount=bucket["amount"],
             measured_count=bucket["measured_count"],
-            pricing_versions=sorted(bucket["pricing_versions"]),
         )
-        for currency, bucket in sorted(cost_totals.items())
+        # None sorts before every str in Python 3's comparison rules for
+        # same-type tuples, but str vs None across different rows in a
+        # mixed sort raises TypeError -- sort on a key that substitutes ""
+        # for None instead of comparing pricing_version directly.
+        for (currency, pricing_version), bucket in sorted(
+            cost_totals.items(), key=lambda item: (item[0][0], item[0][1] or "")
+        )
     ]
 
     score_values: dict[str, list[dict[str, Any]]] = {}
@@ -328,7 +330,7 @@ def _aggregate_one_class(calibration_class: str, rows: Sequence[Any]) -> Calibra
     return CalibrationClassAggregate(
         calibration_class=calibration_class,
         count=len(rows),
-        cost_by_currency=cost_by_currency,
+        cost_buckets=cost_buckets,
         cost_unavailable_count=cost_unavailable_count,
         # A caller may show the partial subtotal above, but only this flag
         # tells it whether that subtotal is the *complete* total -- ADR-021:

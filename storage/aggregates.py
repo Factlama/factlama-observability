@@ -10,29 +10,45 @@ needs a `contracts/v0.1` compatibility bump.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from schemas.reliability_event import ReliabilityEvent
 
 
 @dataclass(frozen=True)
 class EventPage:
-    """One page of `list_reliability_events`. `next_cursor` is `None` only
-    when this page reached the end of the matching set -- never omitted to
-    mean "maybe more, caller should guess."""
+    """One page of `list_reliability_events`. `next_position` is the raw
+    keyset marker `(occurred_at, event_id)` for the next page, or `None`
+    only when this page reached the end of the matching set -- never
+    omitted to mean "maybe more, caller should guess." Deliberately not an
+    encoded cursor string: signing/binding an opaque cursor is an API-layer
+    concern (`query/api/cursor.py`), not something this storage port
+    should know how to do."""
 
     items: list[ReliabilityEvent]
-    next_cursor: str | None
+    next_position: tuple[datetime, str] | None
 
 
 @dataclass(frozen=True)
-class CurrencyCost:
-    """One currency's summed cost within a calibration class, counting only
-    events whose `usage_summary.cost.status == "MEASURED"`."""
+class CostBucket:
+    """One (currency, pricing_version) bucket's summed cost within a
+    calibration class, counting only events whose
+    `usage_summary.cost.status == "MEASURED"`.
+
+    `pricing_version=None` is its own distinct, explicit bucket for
+    "measured cost with no recorded pricing-version provenance" -- it is
+    never merged into a versioned bucket of the same currency (ADR-021:
+    "Group cost by the tuple (currency, pricing source, pricing version)
+    ... a list of versions beside one pooled amount is not separate
+    grouping"). `ReliabilityEvent.usage_summary.cost` has no separate
+    "pricing source" field today, only `pricing_version` -- this is the
+    one provenance dimension this schema can actually carry until that
+    changes."""
 
     currency: str
+    pricing_version: str | None
     amount: float
     measured_count: int
-    pricing_versions: list[str]
 
 
 @dataclass(frozen=True)
@@ -59,7 +75,7 @@ class CalibrationClassAggregate:
 
     calibration_class: str
     count: int
-    cost_by_currency: list[CurrencyCost]
+    cost_buckets: list[CostBucket]
     cost_unavailable_count: int
     cost_coverage_complete: bool
     scores: list[ScoreAggregate] = field(default_factory=list)

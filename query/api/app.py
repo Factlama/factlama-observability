@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from operations.metrics import install_metrics
 from query.api.bootstrap import check_storage_ready, lifespan
+from query.api.cursor import CursorError, decode_cursor, encode_cursor
 from query.api.errors import QueryError, QueryErrorCode
 from query.api.settings import Settings, get_settings
 from schemas.tenancy import TenantContext
@@ -135,29 +136,71 @@ def _resolve_window(since: str | None, until: str | None) -> tuple[datetime, dat
 async def list_evaluations(
     tenant_context: Annotated[TenantContext, Depends(authenticate)],
     store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
     since: str | None = None,
     until: str | None = None,
-    limit: int = DEFAULT_LIST_LIMIT,
+    limit: int | None = None,
     cursor: str | None = None,
 ) -> JSONResponse:
     """OBS-07 stage-3: evaluation listing using only existing
     `ReliabilityEvent` data -- no trace/span fields, per ADR-021's
-    independent-slice scoping."""
-    if not (1 <= limit <= MAX_LIST_LIMIT):
+    independent-slice scoping.
+
+    `limit`/`since`/`until` default to `None` (not yet resolved) rather
+    than a fixed constant: a continuation request is expected to omit
+    them and let the cursor carry its originally-resolved values forward
+    (ADR-021); a continuation request that supplies one anyway is checked
+    for consistency with the cursor, not silently overridden by it."""
+    since_param = _parse_timestamp(since, "since") if since else None
+    until_param = _parse_timestamp(until, "until") if until else None
+    if limit is not None and not (1 <= limit <= MAX_LIST_LIMIT):
         raise QueryError(
             QueryErrorCode.INVALID_ARGUMENT, f"limit must be between 1 and {MAX_LIST_LIMIT}"
         )
-    since_dt, until_dt = _resolve_window(since, until)
+
+    after: tuple[datetime, str] | None = None
+    if cursor is not None:
+        try:
+            since_dt, until_dt, resolved_limit, occurred_at, event_id = decode_cursor(
+                cursor,
+                secret=settings.query_cursor_secret,
+                tenant_id=tenant_context.tenant_id,
+                project_id=tenant_context.project_id,
+                application_id=tenant_context.application_id,
+                since=since_param,
+                until=until_param,
+                limit=limit,
+            )
+        except CursorError as exc:
+            raise QueryError(QueryErrorCode.INVALID_ARGUMENT, str(exc)) from exc
+        after = (occurred_at, event_id)
+    else:
+        since_dt, until_dt = _resolve_window(since, until)
+        resolved_limit = limit if limit is not None else DEFAULT_LIST_LIMIT
+
     try:
         page = await store.list_reliability_events(
-            tenant_context, since=since_dt, until=until_dt, limit=limit, cursor=cursor
+            tenant_context, since=since_dt, until=until_dt, limit=resolved_limit, after=after
         )
     except StorageUnavailableError as exc:
         raise QueryError(
             QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
         ) from exc
-    except ValueError as exc:
-        raise QueryError(QueryErrorCode.INVALID_ARGUMENT, "cursor is invalid") from exc
+
+    next_cursor = None
+    if page.next_position is not None:
+        next_occurred_at, next_event_id = page.next_position
+        next_cursor = encode_cursor(
+            secret=settings.query_cursor_secret,
+            tenant_id=tenant_context.tenant_id,
+            project_id=tenant_context.project_id,
+            application_id=tenant_context.application_id,
+            since=since_dt,
+            until=until_dt,
+            limit=resolved_limit,
+            occurred_at=next_occurred_at,
+            event_id=next_event_id,
+        )
     return JSONResponse(
         status_code=200,
         content={
@@ -167,7 +210,7 @@ async def list_evaluations(
             # schema_version; this route had been the one exception.
             "schema_version": "0.1",
             "items": [event.model_dump(mode="json", exclude_none=True) for event in page.items],
-            "next_cursor": page.next_cursor,
+            "next_cursor": next_cursor,
             "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
             "as_of": datetime.now(timezone.utc).isoformat(),
         },
@@ -214,14 +257,14 @@ async def get_evaluation_aggregates(
                     {
                         "calibration_class": agg.calibration_class,
                         "count": agg.count,
-                        "cost_by_currency": [
+                        "cost_buckets": [
                             {
-                                "currency": cost.currency,
-                                "amount": cost.amount,
-                                "measured_count": cost.measured_count,
-                                "pricing_versions": cost.pricing_versions,
+                                "currency": bucket.currency,
+                                "pricing_version": bucket.pricing_version,
+                                "amount": bucket.amount,
+                                "measured_count": bucket.measured_count,
                             }
-                            for cost in agg.cost_by_currency
+                            for bucket in agg.cost_buckets
                         ],
                         "cost_unavailable_count": agg.cost_unavailable_count,
                         "cost_coverage_complete": agg.cost_coverage_complete,

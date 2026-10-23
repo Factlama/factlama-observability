@@ -73,16 +73,23 @@ class TelemetryStore(Protocol):
         since: datetime,
         until: datetime,
         limit: int,
-        cursor: str | None = None,
+        after: tuple[datetime, str] | None = None,
     ) -> EventPage:
-        """OBS-07 stage-3 (2026-10-23): a bounded, tenant/project/application
-        -scoped page of events whose `received_at` falls in `[since, until]`,
-        newest first. `limit` is the caller's already-validated, bounded page
-        size (`query/api/app.py` enforces the max before calling this).
-        `cursor`, when given, is an opaque value from a previous page's
-        `EventPage.next_cursor` -- never a client-constructed offset, so
-        concurrent inserts/deletes cannot skip or duplicate rows the way an
-        offset-based page could.
+        """OBS-07 stage-3 (2026-10-23, corrected per ADR-021): a bounded,
+        tenant/project/application-scoped page of events whose `occurred_at`
+        -- the event's own time, not when this service happened to receive
+        it -- falls in the half-open window `[since, until)`, newest
+        `occurred_at` first. Half-open so two adjacent windows
+        (`[a, b)` and `[b, c)`) never both match a row with `occurred_at ==
+        b`. `limit` is the caller's already-validated, bounded page size
+        (`query/api/app.py` enforces the max before calling this). `after`,
+        when given, is the raw `(occurred_at, event_id)` keyset marker from
+        a previous page's `EventPage.next_position` -- never a client-
+        constructed offset, so concurrent inserts/deletes cannot skip or
+        duplicate rows the way an offset-based page could. Binding this
+        value to the caller's authenticated scope and originally-resolved
+        window, and signing it, is `query/api/cursor.py`'s job, not this
+        method's -- a raw position is all the storage layer needs to know.
 
         Raises `storage.errors.StorageUnavailableError` on a durable-store
         failure, same as `get_reliability_event`."""
@@ -91,14 +98,18 @@ class TelemetryStore(Protocol):
     async def aggregate_reliability_events(
         self, tenant: TenantContext, *, since: datetime, until: datetime
     ) -> list[CalibrationClassAggregate]:
-        """OBS-07/14 stage-3 (2026-10-23): calibration-class-grouped score
-        and cost aggregates over `[since, until]`, scoped the same way
-        `list_reliability_events` is. Each event contributes to exactly one
-        class's aggregate -- `(tenant_id, event_id)` is this table's primary
-        key, so a redelivered duplicate is already one row before this
-        method ever runs, not something it must itself deduplicate.
-        `MIXED` is one more class among the returned entries, never merged
-        into the classes `calibration_classes` names.
+        """OBS-07/14 stage-3 (2026-10-23, corrected per ADR-021):
+        calibration-class-grouped score and cost aggregates over the
+        half-open event-time window `[since, until)` -- `occurred_at`, not
+        `received_at`: "Evaluation aggregate windows use occurred_at, not
+        received_at... Late arrivals update their occurrence window
+        exactly once." Scoped the same way `list_reliability_events` is.
+        Each event contributes to exactly one class's aggregate --
+        `(tenant_id, event_id)` is this table's primary key, so a
+        redelivered duplicate is already one row before this method ever
+        runs, not something it must itself deduplicate. `MIXED` is one more
+        class among the returned entries, never merged into the classes
+        `calibration_classes` names.
 
         Raises `storage.errors.StorageUnavailableError` on a durable-store
         failure, same as `get_reliability_event`."""

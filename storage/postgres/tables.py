@@ -47,8 +47,15 @@ reliability_events = Table(
     # high-cardinality IDs" -- supports a future evaluation-detail lookup
     # (OBS-07) without a full tenant scan.
     Index("ix_reliability_events_evaluation", "tenant_id", "evaluation_id"),
-    # OBS-07's listing/aggregate routes (2026-10-23 G6 stage 3) filter and
-    # keyset-paginate by (tenant_id, received_at); without this, every
-    # bounded-time-window query would be a full per-tenant scan.
+    # Retention's own cutoff (storage/postgres/backend.py::delete_reliability_events)
+    # is receipt-time by nature ("how long have we stored this"), not
+    # event-time; kept for that query, even though the listing/aggregate
+    # routes below moved off it.
     Index("ix_reliability_events_tenant_received", "tenant_id", "received_at"),
+    # OBS-07's listing/aggregate routes filter and keyset-paginate by
+    # (tenant_id, occurred_at) -- event time, corrected 2026-10-24 per
+    # ADR-021 from the original (tenant_id, received_at) above. Without
+    # this, every bounded-time-window query would be a full per-tenant
+    # scan.
+    Index("ix_reliability_events_tenant_occurred", "tenant_id", "occurred_at"),
 )

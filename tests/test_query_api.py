@@ -11,7 +11,7 @@ as the one OBS-07 needed to exist to close.
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -22,9 +22,14 @@ from query.api.auth import TenantCredentialStore
 from query.api.settings import Settings, get_settings
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
-from storage.aggregates import CalibrationClassAggregate, CurrencyCost, EventPage
+from storage.aggregates import CalibrationClassAggregate, CostBucket, EventPage
 from storage.errors import StorageUnavailableError
 from tests.conformance.conftest import make_event
+
+
+def _occurred_at(event: ReliabilityEvent) -> datetime:
+    return datetime.fromisoformat(event.occurred_at.replace("Z", "+00:00"))
+
 
 TENANT_ONE_KEY = "tenant-one-key"
 TENANT_ONE_SCOPED_KEY = "tenant-one-scoped-key"
@@ -77,55 +82,65 @@ class FakeTelemetryStore:
         since: datetime,
         until: datetime,
         limit: int,
-        cursor: str | None = None,
+        after: tuple[datetime, str] | None = None,
     ) -> EventPage:
-        """Deliberately simplified -- does not apply `since`/`until` (this
-        fake has no `received_at` to filter on) and paginates by a plain
-        integer offset, not a real keyset cursor. Real time-window/cursor
-        correctness is proven against actual PostgreSQL by
-        `tests/conformance/test_reliability_events_query.py`; this fake only
-        needs to exercise the route's auth/tenant-scoping and response
-        shape."""
+        """Applies the same half-open event-time window, scope and keyset
+        semantics the real Postgres backend does -- this fake is faithful
+        enough to actually exercise the route's window/cursor-binding
+        logic; `tests/conformance/test_reliability_events_query.py`
+        separately proves the real backend matches it."""
         if self.fail_next:
             self.fail_next = False
             raise StorageUnavailableError("simulated storage outage")
-        matches = sorted(self._scoped(tenant), key=lambda e: e.event_id, reverse=True)
-        start = int(cursor) if cursor else 0
-        page = matches[start : start + limit]
-        next_cursor = str(start + limit) if start + limit < len(matches) else None
-        return EventPage(items=page, next_cursor=next_cursor)
+        matches = [e for e in self._scoped(tenant) if since <= _occurred_at(e) < until]
+        matches.sort(key=lambda e: (_occurred_at(e), e.event_id), reverse=True)
+        if after is not None:
+            matches = [e for e in matches if (_occurred_at(e), e.event_id) < after]
+        page = matches[:limit]
+        next_position = (
+            (_occurred_at(page[-1]), page[-1].event_id) if len(matches) > limit else None
+        )
+        return EventPage(items=page, next_position=next_position)
 
     async def aggregate_reliability_events(
         self, tenant: TenantContext, *, since: datetime, until: datetime
     ) -> list[CalibrationClassAggregate]:
-        """Same simplification as `list_reliability_events` above."""
+        """Same half-open event-time window as `list_reliability_events`."""
         if self.fail_next:
             self.fail_next = False
             raise StorageUnavailableError("simulated storage outage")
         by_class: dict[str, list[ReliabilityEvent]] = {}
         for event in self._scoped(tenant):
+            if not (since <= _occurred_at(event) < until):
+                continue
             by_class.setdefault(event.calibration_class, []).append(event)
         aggregates: list[CalibrationClassAggregate] = []
         for calibration_class, events in sorted(by_class.items()):
             measured = [e for e in events if e.usage_summary.cost.status == "MEASURED"]
-            by_currency: dict[str, float] = {}
+            buckets: dict[tuple[str, str | None], dict[str, float | int]] = {}
             for event in measured:
-                currency = event.usage_summary.cost.currency or "?"
-                by_currency[currency] = by_currency.get(currency, 0.0) + (
-                    event.usage_summary.cost.amount or 0.0
+                cost = event.usage_summary.cost
+                key = (cost.currency or "?", cost.pricing_version)
+                bucket = buckets.setdefault(key, {"amount": 0.0, "measured_count": 0})
+                bucket["amount"] = bucket["amount"] + (cost.amount or 0.0)
+                bucket["measured_count"] = int(bucket["measured_count"]) + 1
+            cost_buckets = [
+                CostBucket(
+                    currency=currency,
+                    pricing_version=pricing_version,
+                    amount=float(bucket["amount"]),
+                    measured_count=int(bucket["measured_count"]),
                 )
-            cost_by_currency = [
-                CurrencyCost(
-                    currency=currency, amount=amount, measured_count=1, pricing_versions=[]
+                for (currency, pricing_version), bucket in sorted(
+                    buckets.items(), key=lambda item: (item[0][0], item[0][1] or "")
                 )
-                for currency, amount in sorted(by_currency.items())
             ]
             unavailable = len(events) - len(measured)
             aggregates.append(
                 CalibrationClassAggregate(
                     calibration_class=calibration_class,
                     count=len(events),
-                    cost_by_currency=cost_by_currency,
+                    cost_buckets=cost_buckets,
                     cost_unavailable_count=unavailable,
                     cost_coverage_complete=unavailable == 0,
                     scores=[],
@@ -167,6 +182,7 @@ def _test_settings() -> Settings:
         }
     )
     settings.database_url = None
+    settings.query_cursor_secret = "test-cursor-secret"
     return settings
 
 
@@ -339,6 +355,59 @@ class TestListEvaluations:
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
 
+    def test_cursor_pagination_does_not_skip_or_duplicate(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        base = datetime.now(timezone.utc) - timedelta(hours=1)
+        for i in range(5):
+            _seed(
+                store,
+                make_event(
+                    tenant_id="tenant-one",
+                    event_id=f"e{i}",
+                    occurred_at=(base + timedelta(minutes=i)).isoformat(),
+                ),
+            )
+        seen: list[str] = []
+        cursor: str | None = None
+        for _ in range(10):  # bounded loop guard against an infinite-pagination bug
+            params = {"limit": "2"} | ({"cursor": cursor} if cursor else {})
+            response = _list(client, token=TENANT_ONE_KEY, **params)
+            assert response.status_code == 200
+            body = response.json()
+            seen.extend(item["event_id"] for item in body["items"])
+            cursor = body["next_cursor"]
+            if cursor is None:
+                break
+
+        assert sorted(seen) == [f"e{i}" for i in range(5)]
+        assert len(seen) == len(set(seen))
+
+    def test_a_cursor_cannot_be_reused_under_a_different_tenant(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        _seed(store, make_event(tenant_id="tenant-one", event_id="e1"))
+        _seed(store, make_event(tenant_id="tenant-one", event_id="e2"))
+        first_page = _list(client, token=TENANT_ONE_KEY, limit="1")
+        cursor = first_page.json()["next_cursor"]
+        assert cursor is not None
+
+        response = _list(client, token=TENANT_TWO_KEY, cursor=cursor)
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+    def test_a_cursor_cannot_be_reused_with_a_different_limit(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        _seed(store, make_event(tenant_id="tenant-one", event_id="e1"))
+        _seed(store, make_event(tenant_id="tenant-one", event_id="e2"))
+        first_page = _list(client, token=TENANT_ONE_KEY, limit="1")
+        cursor = first_page.json()["next_cursor"]
+        assert cursor is not None
+
+        response = _list(client, token=TENANT_ONE_KEY, cursor=cursor, limit="2")
+        assert response.status_code == 400
+
 
 class TestEvaluationAggregates:
     """OBS-07/14 stage-3 (2026-10-23): calibration-class-grouped aggregates
@@ -369,7 +438,7 @@ class TestEvaluationAggregates:
             {
                 "calibration_class": "class-a",
                 "count": 1,
-                "cost_by_currency": [],
+                "cost_buckets": [],
                 "cost_unavailable_count": 1,
                 "cost_coverage_complete": False,
                 "scores": [],

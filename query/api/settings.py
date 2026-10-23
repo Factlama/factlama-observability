@@ -4,6 +4,7 @@
 """
 
 import os
+import secrets
 from functools import lru_cache
 
 from query.api.auth import TenantCredentialStore
@@ -21,6 +22,19 @@ class Settings:
         # startup/readiness explicitly") -- Settings itself stays usable
         # without a database for anything that does not need one.
         self.database_url = os.environ.get("FACTLAMA_DATABASE_URL")
+        # ADR-021: "Cursors bind authenticated tenant/project/application
+        # scope, resolved window, filters, sort order, query version and
+        # finite expiry, with integrity protection." This HMAC-signs that
+        # bound state (query/api/cursor.py). Falling back to a random
+        # per-process secret when unset means pagination simply fails
+        # closed (a 400 asking the caller to restart from page one) across
+        # a restart or a second replica, not a security hole -- tenant
+        # isolation is independently enforced by the authenticated
+        # TenantContext on every call regardless of cursor content. A real
+        # multi-instance deployment must set this explicitly.
+        self.query_cursor_secret = os.environ.get(
+            "FACTLAMA_QUERY_CURSOR_SECRET"
+        ) or secrets.token_hex(32)
 
 
 @lru_cache
