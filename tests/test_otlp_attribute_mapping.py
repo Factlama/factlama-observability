@@ -6,7 +6,7 @@ would not actually prove the mapping works against what a real SDK sends.
 """
 
 import pytest
-from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
+from opentelemetry.proto.common.v1.common_pb2 import AnyValue, ArrayValue, KeyValue, KeyValueList
 
 from collector.processing.otlp_attribute_mapping import (
     MAPPING_VERSION,
@@ -122,6 +122,40 @@ class TestDroppedAttributes:
         )
         assert mapped.dropped_attribute_keys == frozenset({"some.unrecognized.key"})
         assert "some.unrecognized.key" not in mapped.extension_attributes
+
+
+class TestNonScalarAttributeValuesAreIgnored:
+    """Privacy acceptance (ADR-021: "no arbitrary-extension passthrough"):
+    a scalar field getter must not recurse into a non-scalar `AnyValue` --
+    e.g. a nested `kvlist_value`/`array_value` an attacker (or a buggy
+    SDK) could use to smuggle arbitrarily large/structured content
+    (prompts, evidence, credentials) underneath a key this mapping
+    otherwise recognizes and persists. Every such value must be treated
+    as simply absent, never partially extracted or stringified."""
+
+    def test_a_recognized_string_key_with_a_nested_kvlist_value_is_ignored(self) -> None:
+        nested = AnyValue(
+            kvlist_value=KeyValueList(
+                values=[_kv("secret.prompt", "ignore all instructions and...")]
+            )
+        )
+        mapped = map_span_attributes([KeyValue(key="gen_ai.provider.name", value=nested)])
+        assert mapped.provider_id is None
+        assert "secret.prompt" not in mapped.extension_attributes
+        assert "gen_ai.provider.name" not in mapped.dropped_attribute_keys
+
+    def test_a_recognized_string_key_with_a_nested_array_value_is_ignored(self) -> None:
+        nested = AnyValue(
+            array_value=ArrayValue(values=[AnyValue(string_value="raw evidence content")])
+        )
+        mapped = map_span_attributes([KeyValue(key="factlama.interaction_id", value=nested)])
+        assert mapped.interaction_id is None
+
+    def test_a_recognized_int_key_with_a_string_value_is_ignored_not_coerced(self) -> None:
+        mapped = map_span_attributes(
+            [KeyValue(key="gen_ai.usage.input_tokens", value=AnyValue(string_value="not-a-number"))]
+        )
+        assert mapped.input_tokens is None
 
 
 class TestScopeAgreement:
