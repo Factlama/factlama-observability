@@ -50,6 +50,13 @@ dev = [
     # project's own OBS-10 ("Prometheus-compatible metrics where
     # appropriate") already names.
     "prometheus-client>=0.20.0",
+    # ADR-021 (2026-10-24): generated Python classes for the OTLP wire
+    # messages (ExportTraceServiceRequest/Response, Span, KeyValue, ...),
+    # pinned exactly -- this package's own version tracks the OTel Python
+    # SDK release train, not semconv_version or mapping_version
+    # (collector/otlp/attribute_mapping.py); do not equate them (ADR-021:
+    # "do not equate that package version with either field").
+    "opentelemetry-proto==1.45.1",
     # OBS-06's storage conformance suite must run against a real database
     # instance, not mocks (same rule as factlama-reliability's ADR-019 SS4).
     # testcontainers launches/tears down a throwaway Postgres via the local
@@ -60,6 +67,7 @@ api = [
     "fastapi>=0.109.0",
     "uvicorn>=0.27.0",
     "prometheus-client>=0.20.0",
+    "opentelemetry-proto==1.45.1",
 ]
 
 [tool.hatch.build.targets.wheel]
