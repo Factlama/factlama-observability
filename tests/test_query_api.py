@@ -17,8 +17,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from operations.tenant_credentials import TenantCredentialStore
 from query.api.app import app, get_storage_readiness, get_telemetry_store
-from query.api.auth import TenantCredentialStore
 from query.api.settings import Settings, get_settings
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext

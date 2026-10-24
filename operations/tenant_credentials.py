@@ -1,10 +1,18 @@
-"""Credential validation and trusted tenant scope for the query API,
-mirroring `factlama-reliability/api/auth.py::TenantCredentialStore` exactly
-(same config-driven API-key-to-`TenantContext` map, same "tenant never
-comes from untrusted body/header" rule) -- and deliberately reusing that
-repo's env var name, `FACTLAMA_TENANT_CREDENTIALS`: a real deployment issuing
-one tenant-scoped API key expects it to authenticate against both services,
-not maintain two separate credential maps for one platform identity.
+"""Credential validation and trusted tenant scope, mirroring
+`factlama-reliability/api/auth.py::TenantCredentialStore` exactly (same
+config-driven API-key-to-`TenantContext` map, same "tenant never comes
+from untrusted body/header" rule) -- and deliberately reusing that
+repo's env var name, `FACTLAMA_TENANT_CREDENTIALS`: a real deployment
+issuing one tenant-scoped API key expects it to authenticate against
+every service in this repo, not maintain a separate credential map per
+service for one platform identity.
+
+Lives in `operations/`, not `query/api/` (where it originated for OBS-07's
+first slice): `collector`'s OTLP ingress needs the identical per-tenant
+authentication (ADR-021: "tenant derived from credentials"), and `query`
+must not depend on `collector` or vice versa (`pyproject.toml`'s
+import-linter contract) -- this is the shared, cross-cutting module both
+can import without coupling the two services together.
 """
 
 import json

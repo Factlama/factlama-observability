@@ -7,7 +7,7 @@ import os
 import secrets
 from functools import lru_cache
 
-from query.api.auth import TenantCredentialStore
+from operations.tenant_credentials import TenantCredentialStore
 
 
 class Settings:
