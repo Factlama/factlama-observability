@@ -1,16 +1,9 @@
-"""OBS-04's authenticated internal ReliabilityEvent receiver
-(`docs/collector.md`, `LOW_LEVEL_IMPLEMENTATION.md`): `POST
-/internal/v0.1/reliability-events`, the missing consumer
-`factlama-reliability/worker/outbox_delivery.py`'s docstring already
-anticipates ("G6's real ingress ... a real G6 integration supplies its own
-async callable here"). Wiring that real HTTP `deliver` callable on the
-Reliability side, and the required cross-repo integration test, is the
-natural next pass -- not done here.
-
-The OTLP/HTTP trace receiver (`docs/collector.md`'s other ingress path) is
-deliberately not built yet: it needs a canonical `AITrace`/span schema that
-does not exist in `contracts/v0.1`, the same reason OBS-03 already deferred
-that model (`schemas/reliability_event.py`'s docstring).
+"""OBS-04's authenticated ingress: `POST /internal/v0.1/reliability-events`
+(the internal ReliabilityEvent receiver `factlama-reliability/worker/
+outbox_delivery.py`'s docstring already anticipated) and, since
+2026-10-24 (ADR-021), `POST /v1/traces` -- the OTLP/HTTP Protobuf trace
+receiver, once blocked on a canonical `AITrace`/span schema that now
+exists in `contracts/v0.1`.
 """
 
 import logging
@@ -19,18 +12,27 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceResponse
 from prometheus_client import Counter
 from pydantic import ValidationError
 
-from collector.ingress.auth import authenticate_workload
+from collector.ingress.auth import authenticate_tenant, authenticate_workload
 from collector.ingress.bootstrap import check_storage_ready, lifespan
 from collector.ingress.errors import IngressError, IngressErrorCode
+from collector.ingress.otlp import (
+    SpanParseError,
+    map_resource_attributes,
+    parse_request_body,
+    parse_span,
+)
 from collector.ingress.settings import Settings, get_settings
 from operations.concurrency import ConcurrencyLimiter
 from operations.metrics import install_metrics
 from schemas.reliability_event import ReliabilityEvent
+from schemas.tenancy import TenantContext
 from storage.backend import TelemetryStore
 from storage.errors import StorageUnavailableError
+from storage.spans import SpanRecordOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,14 @@ INGRESS_EVENTS_TOTAL = Counter(
     "obs_ingress_events_total",
     "Total ReliabilityEvent ingestion outcomes, by outcome -- the IngressErrorCode "
     "value for a rejection, or 'accepted'/'duplicate' for a successful write.",
+    ["outcome"],
+    registry=_metrics_registry,
+)
+
+OTLP_SPANS_TOTAL = Counter(
+    "obs_otlp_spans_total",
+    "Total OTLP span ingestion outcomes, by outcome (accepted, duplicate, rejected). "
+    "A conflict (same identity, different content) counts as rejected.",
     ["outcome"],
     registry=_metrics_registry,
 )
@@ -227,3 +237,92 @@ async def receive_reliability_event(
         "status": "accepted" if newly_inserted else "duplicate",
     }
     return JSONResponse(status_code=200, content=response_body)
+
+
+def _require_protobuf_content_type(request: Request) -> None:
+    content_type = request.headers.get("content-type", "")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if media_type != "application/x-protobuf":
+        raise IngressError(
+            IngressErrorCode.UNSUPPORTED_VERSION,
+            f"Content-Type must be application/x-protobuf, got {content_type or '(none)'}",
+        )
+
+
+_MAX_OTLP_DIAGNOSTICS = 10
+"""docs/collector.md: "bounded diagnostics without payload content" --
+caps how many per-span error strings one response carries, not how many
+spans may be rejected (every rejected span still counts toward
+`rejected_spans`)."""
+
+
+@app.post("/v1/traces")
+async def receive_otlp_traces(
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(authenticate_tenant)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+) -> Response:
+    """ADR-021's OTLP trace ingress. Malformed Protobuf or an oversized
+    batch rejects the whole request before anything is normalized or
+    persisted; a problem with one span inside an otherwise-valid batch
+    only rejects that span, counted in the response's
+    `partial_success.rejected_spans` -- every span that did validate is
+    still persisted (`docs/collector.md`)."""
+    _require_protobuf_content_type(request)
+    _enforce_content_length_limit(request, settings.otlp_max_body_bytes)
+    body = await _read_body_within_limit(request, settings.otlp_max_body_bytes)
+
+    try:
+        batch = parse_request_body(body)
+    except SpanParseError as exc:
+        raise IngressError(IngressErrorCode.INVALID_ARGUMENT, str(exc)) from exc
+
+    if batch.total_span_count > settings.otlp_max_spans_per_batch:
+        raise IngressError(
+            IngressErrorCode.INVALID_ARGUMENT,
+            f"batch of {batch.total_span_count} spans exceeds the "
+            f"{settings.otlp_max_spans_per_batch}-span limit",
+        )
+
+    rejected_count = 0
+    diagnostics: list[str] = []
+    for resource, resource_spans in batch.resource_groups:
+        resource_attributes = map_resource_attributes(resource)
+        for otlp_span in resource_spans:
+            try:
+                normalized = parse_span(
+                    otlp_span, resource_attributes=resource_attributes, tenant=tenant
+                )
+            except SpanParseError as exc:
+                rejected_count += 1
+                diagnostics.append(str(exc))
+                OTLP_SPANS_TOTAL.labels(outcome="rejected").inc()
+                continue
+
+            try:
+                outcome = await store.record_normalized_span(normalized)
+            except StorageUnavailableError as exc:
+                raise IngressError(
+                    IngressErrorCode.DEPENDENCY_UNAVAILABLE,
+                    "durable storage is temporarily unavailable",
+                ) from exc
+
+            if outcome == SpanRecordOutcome.CONFLICT:
+                rejected_count += 1
+                diagnostics.append(
+                    f"span {normalized.span_id!r} conflicts with a stored span of the same identity"
+                )
+                OTLP_SPANS_TOTAL.labels(outcome="rejected").inc()
+            else:
+                # ACCEPTED or DUPLICATE -- ADR-021: "Exact replay is
+                # successful acceptance, not a rejected span."
+                OTLP_SPANS_TOTAL.labels(outcome=outcome.value.lower()).inc()
+
+    response = ExportTraceServiceResponse()
+    if rejected_count:
+        response.partial_success.rejected_spans = rejected_count
+        response.partial_success.error_message = "; ".join(diagnostics[:_MAX_OTLP_DIAGNOSTICS])
+    return Response(
+        content=response.SerializeToString(), media_type="application/x-protobuf", status_code=200
+    )

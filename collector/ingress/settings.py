@@ -7,6 +7,7 @@ import os
 from functools import lru_cache
 
 from operations.config import optional_env
+from operations.tenant_credentials import TenantCredentialStore
 
 # docs/collector.md: "Enforce configured compressed/uncompressed body size
 # ... before durable writes." A single ReliabilityEvent's metadata-only
@@ -22,6 +23,11 @@ DEFAULT_MAX_BODY_BYTES = 1_000_000
 # let that same exhaustion happen anyway under real load.
 DEFAULT_MAX_CONCURRENT_REQUESTS = 20
 
+# ADR-021's "OTLP trace ingress implementation profile" (docs/collector.md),
+# pinned 2026-10-24.
+DEFAULT_OTLP_MAX_BODY_BYTES = 4 * 1024 * 1024
+DEFAULT_OTLP_MAX_SPANS_PER_BATCH = 1_000
+
 
 class Settings:
     """Process-wide ingress settings, read once from the environment."""
@@ -33,6 +39,21 @@ class Settings:
         )
         self.max_concurrent_requests = int(
             optional_env("FACTLAMA_MAX_CONCURRENT_REQUESTS", str(DEFAULT_MAX_CONCURRENT_REQUESTS))
+        )
+        self.otlp_max_body_bytes = int(
+            optional_env("FACTLAMA_OTLP_MAX_BODY_BYTES", str(DEFAULT_OTLP_MAX_BODY_BYTES))
+        )
+        self.otlp_max_spans_per_batch = int(
+            optional_env("FACTLAMA_OTLP_MAX_SPANS_PER_BATCH", str(DEFAULT_OTLP_MAX_SPANS_PER_BATCH))
+        )
+        # ADR-021: "tenant derived from credentials" -- ADR-021's OTLP
+        # route is a per-tenant SDK credential, the first this collector
+        # authenticates (unlike the internal ReliabilityEvent receiver's
+        # shared workload token above). Same env var, same store type
+        # query/api/settings.py already uses -- one tenant-scoped API key
+        # authenticates against every service in this repo.
+        self.tenant_store = TenantCredentialStore.from_json(
+            os.environ.get("FACTLAMA_TENANT_CREDENTIALS")
         )
         # Only `collector.ingress.bootstrap`'s lifespan consumes this, and it
         # is the one that enforces "must be set" (mirrors ADR-019 SS3's "fail
