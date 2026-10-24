@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from schemas.aitrace import AITrace
+from schemas.normalized_span import NormalizedSpan
 from schemas.reliability_event import ReliabilityEvent
 
 
@@ -74,9 +76,29 @@ class TestValidReliabilityEventFixtures:
         ReliabilityEvent(**json.loads(path.read_text()))
 
 
+class TestValidNormalizedSpanFixtures:
+    """ADR-021: covers a GENERATION span, a root TOOL span with UNSET
+    status, and a child RETRIEVAL span with ERROR status."""
+
+    @pytest.mark.parametrize("path", _valid_examples("normalized_span"), ids=lambda p: p.stem)
+    def test_parses_as_normalized_span(self, path: Path) -> None:
+        NormalizedSpan(**json.loads(path.read_text()))
+
+
+class TestValidAITraceFixtures:
+    """ADR-021: covers NOT_EVALUATED, mixed PENDING/AVAILABLE links, and
+    RECONCILIATION_EXPIRED."""
+
+    @pytest.mark.parametrize("path", _valid_examples("aitrace"), ids=lambda p: p.stem)
+    def test_parses_as_aitrace(self, path: Path) -> None:
+        AITrace(**json.loads(path.read_text()))
+
+
 def test_at_least_one_fixture_was_actually_found() -> None:
     """A path/glob bug that silently finds zero fixtures would make the
     parametrized test above vacuously pass -- fail loudly instead."""
     if CONTRACTS_DIR is None:
         pytest.skip("contracts/v0.1 not found")
     assert _valid_examples("reliability_event")
+    assert _valid_examples("normalized_span")
+    assert _valid_examples("aitrace")
