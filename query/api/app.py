@@ -301,3 +301,25 @@ async def get_evaluation(
     if event is None:
         raise QueryError(QueryErrorCode.NOT_FOUND, "evaluation not found")
     return JSONResponse(status_code=200, content=event.model_dump(mode="json", exclude_none=True))
+
+
+@app.get("/v0.1/ai/traces/{trace_id}")
+async def get_trace(
+    trace_id: str,
+    tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+) -> JSONResponse:
+    """ADR-021: the `AITrace` read projection -- spans plus evaluation
+    correlation state for one trace. A missing trace and one outside the
+    caller's authorized tenant/project/application scope are
+    indistinguishable (`storage.backend.TelemetryStore.get_trace`'s own
+    docstring), same existence-privacy rule as `get_evaluation` above."""
+    try:
+        trace = await store.get_trace(tenant_context, trace_id)
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+    if trace is None:
+        raise QueryError(QueryErrorCode.NOT_FOUND, "trace not found")
+    return JSONResponse(status_code=200, content=trace.model_dump(mode="json", exclude_none=True))

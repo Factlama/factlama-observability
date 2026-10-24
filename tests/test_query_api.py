@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from operations.tenant_credentials import TenantCredentialStore
 from query.api.app import app, get_storage_readiness, get_telemetry_store
 from query.api.settings import Settings, get_settings
+from schemas.aitrace import AITrace
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
 from storage.aggregates import CalibrationClassAggregate, CostBucket, EventPage
@@ -44,7 +45,22 @@ class FakeTelemetryStore:
 
     def __init__(self) -> None:
         self._events: dict[tuple[str, str], ReliabilityEvent] = {}
+        self._traces: dict[tuple[str, str], AITrace] = {}
         self.fail_next = False
+
+    def seed_trace(self, trace: AITrace) -> None:
+        self._traces[(trace.tenant_id, trace.trace_id)] = trace
+
+    async def get_trace(self, tenant: TenantContext, trace_id: str) -> AITrace | None:
+        if self.fail_next:
+            self.fail_next = False
+            raise StorageUnavailableError("simulated storage outage")
+        trace = self._traces.get((tenant.tenant_id, trace_id))
+        if trace is None:
+            return None
+        if not tenant.authorizes(trace.project_id, trace.application_id):
+            return None
+        return trace
 
     async def record_reliability_event(self, event: ReliabilityEvent) -> bool:
         key = (event.tenant_id, event.event_id)
@@ -194,6 +210,26 @@ def _get(client: TestClient, evaluation_id: str, token: str | None) -> httpx.Res
     return client.get(f"/v0.1/ai/evaluations/{evaluation_id}", headers=_auth(token))
 
 
+def _get_trace(client: TestClient, trace_id: str, token: str | None) -> httpx.Response:
+    return client.get(f"/v0.1/ai/traces/{trace_id}", headers=_auth(token))
+
+
+def _make_trace(
+    *,
+    tenant_id: str = "tenant-one",
+    trace_id: str = "0123456789abcdef0123456789abcdef",
+    project_id: str | None = None,
+    application_id: str | None = None,
+) -> AITrace:
+    return AITrace(
+        tenant_id=tenant_id,
+        project_id=project_id,
+        application_id=application_id,
+        trace_id=trace_id,
+        evaluation_state="NOT_EVALUATED",
+    )
+
+
 class TestAuth:
     def test_missing_auth_is_rejected(self, client: TestClient) -> None:
         response = _get(client, "eval-1", token=None)
@@ -251,6 +287,67 @@ class TestEvaluationLookup:
         )
         response = _get(client, "eval-1", token=TENANT_ONE_SCOPED_KEY)
         assert response.status_code == 200
+
+
+class TestGetTrace:
+    """ADR-021's trace-detail route, scoped identically to
+    `TestEvaluationLookup` above -- missing/cross-tenant/out-of-scope
+    traces all return the same 404, never a status that would confirm the
+    id exists under another tenant."""
+
+    TRACE_ID = "0123456789abcdef0123456789abcdef"
+
+    def test_missing_auth_is_rejected(self, client: TestClient) -> None:
+        response = _get_trace(client, self.TRACE_ID, token=None)
+        assert response.status_code == 401
+
+    def test_owning_tenant_can_read_its_own_trace(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        store.seed_trace(_make_trace(trace_id=self.TRACE_ID))
+        response = _get_trace(client, self.TRACE_ID, token=TENANT_ONE_KEY)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["trace_id"] == self.TRACE_ID
+        assert body["tenant_id"] == "tenant-one"
+        assert body["evaluation_state"] == "NOT_EVALUATED"
+
+    def test_missing_trace_is_not_found(self, client: TestClient) -> None:
+        response = _get_trace(client, "no-such-trace", token=TENANT_ONE_KEY)
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
+    def test_a_different_tenants_key_cannot_read_it_and_gets_the_same_not_found(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        store.seed_trace(_make_trace(trace_id=self.TRACE_ID))
+        response = _get_trace(client, self.TRACE_ID, token=TENANT_TWO_KEY)
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
+    def test_a_project_scoped_key_cannot_read_a_different_projects_trace(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        store.seed_trace(_make_trace(trace_id=self.TRACE_ID, project_id="proj-b"))
+        response = _get_trace(client, self.TRACE_ID, token=TENANT_ONE_SCOPED_KEY)
+        assert response.status_code == 404
+
+    def test_a_project_scoped_key_can_read_its_own_projects_trace(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        store.seed_trace(_make_trace(trace_id=self.TRACE_ID, project_id="proj-a"))
+        response = _get_trace(client, self.TRACE_ID, token=TENANT_ONE_SCOPED_KEY)
+        assert response.status_code == 200
+
+    def test_storage_failure_is_reported_as_dependency_unavailable(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        store.fail_next = True
+        response = _get_trace(client, self.TRACE_ID, token=TENANT_ONE_KEY)
+        assert response.status_code == 503
+        body = response.json()
+        assert body["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        assert body["error"]["retryable"] is True
 
 
 class TestStorageOutage:
