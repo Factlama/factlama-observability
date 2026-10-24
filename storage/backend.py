@@ -7,11 +7,9 @@ without touching ingress code (`pyproject.toml`'s import-linter contract
 enforces this, with `collector.ingress.bootstrap` as the one exempted
 composition-root module).
 
-Scoped to this pass's one operation -- recording an ingested
-`ReliabilityEvent`. Later passes (OBS-04's OTLP/span path, OBS-07's reads)
-extend this port with spans/evaluation_links/query methods once a canonical
-`AITrace`/span schema exists in `contracts/v0.1` to build against; not
-built now, matching OBS-03's own precedent for that same gap.
+Started with the `ReliabilityEvent` operations alone; extended 2026-10-24
+(ADR-021) with `record_normalized_span`/`get_trace` once the canonical
+`AITrace`/span schema existed in `contracts/v0.1` to build against.
 
 No method here takes or returns a SQLAlchemy `Connection`/`Engine` or a
 driver-specific exception -- failures are one of `storage.errors`'s typed
@@ -21,9 +19,12 @@ exceptions.
 from datetime import datetime
 from typing import Protocol
 
+from schemas.aitrace import AITrace
+from schemas.normalized_span import NormalizedSpan
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
 from storage.aggregates import CalibrationClassAggregate, EventPage
+from storage.spans import SpanRecordOutcome
 
 
 class TelemetryStore(Protocol):
@@ -150,6 +151,39 @@ class TelemetryStore(Protocol):
         nothing yet to validate it against -- the same deliberate-gap
         precedent `factlama-reliability/storage/retention.py` already
         established for its own tables.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
+    async def record_normalized_span(self, span: NormalizedSpan) -> SpanRecordOutcome:
+        """ADR-021: persists `span`, identity `(tenant_id, trace_id,
+        span_id)`. An exact replay (`span.canonical_content_hash()`
+        matches the stored row's) returns `DUPLICATE`, a no-op success,
+        never an error. Conflicting content under the same identity
+        returns `CONFLICT` without modifying the stored span.
+
+        If `span.evaluation_id` is set, also touches the matching
+        `evaluation_links` row (creating it on first touch) -- the
+        span-first half of ADR-021's both-order correlation, applying the
+        lazy reconciliation-expiry check in the same pass. A detected
+        link-scope/reference conflict is logged and dropped; it never
+        causes this method to reject the span itself.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
+    async def get_trace(self, tenant: TenantContext, trace_id: str) -> AITrace | None:
+        """OBS-07's trace-detail read (ADR-021): the tenant/project/
+        application-scoped `AITrace` projection for `trace_id` -- its
+        spans plus every `evaluation_links` entry sharing that
+        `trace_id`, with the lazy reconciliation-expiry check applied (and
+        persisted) to each link before deriving the trace-level
+        `evaluation_state` summary. Returns `None` when nothing
+        authorized exists for this `trace_id` -- a missing trace and an
+        inaccessible one are indistinguishable, same existence-privacy
+        rule as `get_reliability_event`.
 
         Raises `storage.errors.StorageUnavailableError` on a durable-store
         failure, same as every other method here."""

@@ -19,6 +19,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.community.postgres import PostgresContainer
 
+from schemas.normalized_span import NormalizedSpan, OperationType, SpanStatus
 from schemas.reliability_event import (
     OverallVerdict,
     QualificationStatusOrMixed,
@@ -68,6 +69,9 @@ def make_event(
     evaluation_id: str = "eval-1",
     project_id: str | None = None,
     application_id: str | None = None,
+    trace_id: str | None = None,
+    span_id: str | None = None,
+    interaction_id: str | None = None,
     calibration_class: str = "class-1",
     scores: dict[str, ScoreValue] | None = None,
     usage_summary: Usage | None = None,
@@ -79,6 +83,9 @@ def make_event(
         evaluation_id=evaluation_id,
         project_id=project_id,
         application_id=application_id,
+        trace_id=trace_id,
+        span_id=span_id,
+        interaction_id=interaction_id,
         occurred_at=occurred_at or datetime.now(timezone.utc).isoformat(),
         status=ResultStatus.COMPLETED,
         verdict=OverallVerdict.PASS,
@@ -87,4 +94,38 @@ def make_event(
         calibration_class=calibration_class,
         qualification_status=QualificationStatusOrMixed.QUALIFIED,
         usage_summary=usage_summary or Usage(),
+    )
+
+
+def make_span(
+    span_id: str = "0123456789abcdef",
+    tenant_id: str = "tenant-a",
+    trace_id: str = "0123456789abcdef0123456789abcdef",
+    parent_span_id: str | None = None,
+    project_id: str | None = None,
+    application_id: str | None = None,
+    operation_type: OperationType = OperationType.GENERATION,
+    evaluation_id: str | None = None,
+    interaction_id: str | None = None,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    usage: Usage | None = None,
+) -> NormalizedSpan:
+    now = datetime.now(timezone.utc)
+    return NormalizedSpan(
+        mapping_version="factlama-genai-1",
+        semconv_version="1.37.0",
+        tenant_id=tenant_id,
+        project_id=project_id,
+        application_id=application_id,
+        trace_id=trace_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
+        operation_type=operation_type,
+        started_at=started_at or now.isoformat(),
+        ended_at=ended_at or now.isoformat(),
+        status=SpanStatus.OK,
+        evaluation_id=evaluation_id,
+        interaction_id=interaction_id,
+        usage=usage or Usage(),
     )

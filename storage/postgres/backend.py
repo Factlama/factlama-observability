@@ -15,17 +15,20 @@ asyncpg/transport `OSError` that SQLAlchemy does not always wrap in a
 contracted retryable 503.
 """
 
+import logging
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from asyncpg import PostgresError  # type: ignore[import-untyped]
-from sqlalchemy import delete, literal, select, tuple_
+from sqlalchemy import delete, literal, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import ColumnElement
 
+from schemas.aitrace import AITrace, EvaluationLink, EvaluationLinkState, EvaluationState
+from schemas.normalized_span import NormalizedSpan, OperationType, SpanStatus
 from schemas.reliability_event import (
     OverallVerdict,
     QualificationStatusOrMixed,
@@ -42,8 +45,23 @@ from storage.aggregates import (
     ScoreAggregate,
 )
 from storage.backend import TelemetryStore
+from storage.correlation import (
+    EvaluationLinkConflict,
+    EvaluationLinkRow,
+    apply_lazy_expiry,
+    derive_trace_evaluation_state,
+    new_link,
+    touch_link,
+)
 from storage.errors import StorageUnavailableError
-from storage.postgres.tables import reliability_events
+from storage.postgres.tables import evaluation_links, reliability_events, spans
+from storage.spans import SpanRecordOutcome
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_RECONCILIATION_WINDOW = timedelta(hours=24)
+"""ADR-021: "Default 24 hours, configurable within (0, 72 hours]." """
+MAX_RECONCILIATION_WINDOW = timedelta(hours=72)
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -102,6 +120,92 @@ def _row_to_event(row: Any) -> ReliabilityEvent:
     )
 
 
+def _span_to_row(span: NormalizedSpan, content_hash: str, received_at: datetime) -> dict[str, Any]:
+    return {
+        "tenant_id": span.tenant_id,
+        "trace_id": span.trace_id,
+        "span_id": span.span_id,
+        "parent_span_id": span.parent_span_id,
+        "project_id": span.project_id,
+        "application_id": span.application_id,
+        "operation_type": span.operation_type.value,
+        "started_at": _parse_timestamp(span.started_at),
+        "ended_at": _parse_timestamp(span.ended_at),
+        "status": span.status.value,
+        "interaction_id": span.interaction_id,
+        "evaluation_id": span.evaluation_id,
+        "provider_id": span.provider_id,
+        "model_id": span.model_id,
+        "model_version": span.model_version,
+        "usage_json": span.usage.model_dump(mode="json"),
+        "resource_attributes_json": span.resource_attributes,
+        "extension_attributes_json": span.extension_attributes,
+        "mapping_version": span.mapping_version,
+        "semconv_version": span.semconv_version,
+        "schema_version": span.schema_version,
+        "content_hash": content_hash,
+        "received_at": received_at,
+    }
+
+
+def _row_to_span(row: Any) -> NormalizedSpan:
+    return NormalizedSpan(
+        schema_version=row.schema_version,
+        mapping_version=row.mapping_version,
+        semconv_version=row.semconv_version,
+        tenant_id=row.tenant_id,
+        project_id=row.project_id,
+        application_id=row.application_id,
+        trace_id=row.trace_id,
+        span_id=row.span_id,
+        parent_span_id=row.parent_span_id,
+        operation_type=OperationType(row.operation_type),
+        started_at=row.started_at.isoformat(),
+        ended_at=row.ended_at.isoformat(),
+        status=SpanStatus(row.status),
+        interaction_id=row.interaction_id,
+        evaluation_id=row.evaluation_id,
+        provider_id=row.provider_id,
+        model_id=row.model_id,
+        model_version=row.model_version,
+        usage=Usage.model_validate(row.usage_json),
+        resource_attributes=row.resource_attributes_json,
+        extension_attributes=row.extension_attributes_json,
+    )
+
+
+def _link_to_row(link: EvaluationLinkRow) -> dict[str, Any]:
+    return {
+        "tenant_id": link.tenant_id,
+        "evaluation_id": link.evaluation_id,
+        "project_id": link.project_id,
+        "application_id": link.application_id,
+        "trace_id": link.trace_id,
+        "span_id": link.span_id,
+        "state": link.state,
+        "first_received_at": link.first_received_at,
+        "expires_at": link.expires_at,
+        "event_received": link.event_received,
+        "span_received": link.span_received,
+    }
+
+
+def _row_to_link(row: Any) -> EvaluationLinkRow:
+    return EvaluationLinkRow(
+        tenant_id=row.tenant_id,
+        evaluation_id=row.evaluation_id,
+        project_id=row.project_id,
+        application_id=row.application_id,
+        trace_id=row.trace_id,
+        span_id=row.span_id,
+        state=row.state,
+        first_received_at=row.first_received_at,
+        expires_at=row.expires_at,
+        event_received=row.event_received,
+        span_received=row.span_received,
+    )
+
+
 def _tenant_scope_clauses(tenant: TenantContext) -> list[ColumnElement[bool]]:
     """SQL-level equivalent of `TenantContext.authorizes()`, for queries
     that can return many rows (unlike `get_reliability_event`'s single-row
@@ -121,8 +225,19 @@ class PostgresTelemetryStore(TelemetryStore):
     implements. Construct one instance per process, sharing one
     `AsyncEngine` from `storage.postgres.engine.create_storage_engine`."""
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        reconciliation_window: timedelta = DEFAULT_RECONCILIATION_WINDOW,
+    ) -> None:
+        if not (timedelta(0) < reconciliation_window <= MAX_RECONCILIATION_WINDOW):
+            raise ValueError(
+                f"reconciliation_window must be in (0, {MAX_RECONCILIATION_WINDOW}], "
+                f"got {reconciliation_window}"
+            )
         self._engine = engine
+        self._reconciliation_window = reconciliation_window
 
     async def record_reliability_event(self, event: ReliabilityEvent) -> bool:
         received_at = datetime.now(timezone.utc)
@@ -135,11 +250,115 @@ class PostgresTelemetryStore(TelemetryStore):
         try:
             async with self._engine.begin() as conn:
                 inserted = (await conn.execute(stmt)).first()
+                if inserted is not None:
+                    # ADR-021: every event with evaluation_id (always set --
+                    # it is a required ReliabilityEvent field) touches a
+                    # link, from either arrival order. Only a *new* insert
+                    # touches it -- a replay of an already-stored event
+                    # must not re-advance correlation state a second time.
+                    await self._touch_evaluation_link(
+                        conn,
+                        tenant_id=event.tenant_id,
+                        evaluation_id=event.evaluation_id,
+                        project_id=event.project_id,
+                        application_id=event.application_id,
+                        trace_id=event.trace_id,
+                        span_id=event.span_id,
+                        source="event",
+                        now=received_at,
+                    )
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not record reliability event {event.event_id!r}: {exc}"
             ) from exc
         return inserted is not None
+
+    async def _touch_evaluation_link(
+        self,
+        conn: AsyncConnection,
+        *,
+        tenant_id: str,
+        evaluation_id: str,
+        project_id: str | None,
+        application_id: str | None,
+        trace_id: str | None,
+        span_id: str | None,
+        source: str,
+        now: datetime,
+    ) -> None:
+        """Best-effort correlation side effect (ADR-021): never raises,
+        and never affects whether the caller's own event/span insert
+        succeeds -- a scope/reference conflict here is logged and the
+        touch is dropped, except for a lazy-expiry flip, which is always
+        persisted even then. A benign race with a concurrent first touch
+        for the same brand-new `(tenant_id, evaluation_id)` resolves via
+        `ON CONFLICT DO NOTHING`: the loser's own touch information is
+        not applied this time, but any later touch still reconciles
+        correctly -- an accepted consequence of the lazy, no-scheduler
+        design, not a correctness gap this pass needs to close."""
+        existing_row = (
+            await conn.execute(
+                select(evaluation_links).where(
+                    evaluation_links.c.tenant_id == tenant_id,
+                    evaluation_links.c.evaluation_id == evaluation_id,
+                )
+            )
+        ).first()
+
+        if existing_row is None:
+            link = new_link(
+                tenant_id=tenant_id,
+                evaluation_id=evaluation_id,
+                project_id=project_id,
+                application_id=application_id,
+                trace_id=trace_id,
+                span_id=span_id,
+                source=source,  # type: ignore[arg-type]
+                now=now,
+                window=self._reconciliation_window,
+            )
+            await conn.execute(
+                pg_insert(evaluation_links)
+                .values(**_link_to_row(link))
+                .on_conflict_do_nothing(index_elements=["tenant_id", "evaluation_id"])
+            )
+            return
+
+        existing = _row_to_link(existing_row)
+        try:
+            updated = touch_link(
+                existing,
+                project_id=project_id,
+                application_id=application_id,
+                trace_id=trace_id,
+                span_id=span_id,
+                source=source,  # type: ignore[arg-type]
+                now=now,
+            )
+        except EvaluationLinkConflict as exc:
+            logger.warning("evaluation_link conflict for %r: %s", evaluation_id, exc)
+            expired = apply_lazy_expiry(existing, now=now)
+            if expired.state != existing.state:
+                await conn.execute(
+                    update(evaluation_links)
+                    .where(
+                        evaluation_links.c.tenant_id == tenant_id,
+                        evaluation_links.c.evaluation_id == evaluation_id,
+                    )
+                    .values(state=expired.state)
+                )
+            return
+
+        link_values = _link_to_row(updated)
+        del link_values["tenant_id"], link_values["evaluation_id"]
+        await conn.execute(
+            update(evaluation_links)
+            .where(
+                evaluation_links.c.tenant_id == tenant_id,
+                evaluation_links.c.evaluation_id == evaluation_id,
+            )
+            .values(**link_values)
+        )
 
     async def get_reliability_event(
         self, tenant: TenantContext, evaluation_id: str
@@ -256,6 +475,139 @@ class PostgresTelemetryStore(TelemetryStore):
                 f"could not delete reliability events for tenant {tenant_id!r}: {exc}"
             ) from exc
         return result.rowcount
+
+    async def record_normalized_span(self, span: NormalizedSpan) -> SpanRecordOutcome:
+        content_hash = span.canonical_content_hash()
+        received_at = datetime.now(timezone.utc)
+        insert_stmt = (
+            pg_insert(spans)
+            .values(**_span_to_row(span, content_hash, received_at))
+            .on_conflict_do_nothing(index_elements=["tenant_id", "trace_id", "span_id"])
+            .returning(spans.c.content_hash)
+        )
+        try:
+            async with self._engine.begin() as conn:
+                inserted = (await conn.execute(insert_stmt)).first()
+                if inserted is not None:
+                    outcome = SpanRecordOutcome.ACCEPTED
+                else:
+                    existing = (
+                        await conn.execute(
+                            select(spans.c.content_hash).where(
+                                spans.c.tenant_id == span.tenant_id,
+                                spans.c.trace_id == span.trace_id,
+                                spans.c.span_id == span.span_id,
+                            )
+                        )
+                    ).first()
+                    # ADR-021: "Exact replay is successful acceptance, not
+                    # a rejected span" -- same hash means DUPLICATE, a
+                    # no-op success; a different hash under the same
+                    # identity is CONFLICT, rejected without modifying
+                    # the stored span.
+                    outcome = (
+                        SpanRecordOutcome.DUPLICATE
+                        if existing is not None and existing.content_hash == content_hash
+                        else SpanRecordOutcome.CONFLICT
+                    )
+                if outcome != SpanRecordOutcome.CONFLICT and span.evaluation_id is not None:
+                    await self._touch_evaluation_link(
+                        conn,
+                        tenant_id=span.tenant_id,
+                        evaluation_id=span.evaluation_id,
+                        project_id=span.project_id,
+                        application_id=span.application_id,
+                        trace_id=span.trace_id,
+                        span_id=span.span_id,
+                        source="span",
+                        now=received_at,
+                    )
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(
+                f"could not record span {span.span_id!r} for trace {span.trace_id!r}: {exc}"
+            ) from exc
+        return outcome
+
+    async def get_trace(self, tenant: TenantContext, trace_id: str) -> AITrace | None:
+        now = datetime.now(timezone.utc)
+        try:
+            async with self._engine.begin() as conn:
+                span_rows = (
+                    await conn.execute(
+                        select(spans).where(
+                            spans.c.tenant_id == tenant.tenant_id, spans.c.trace_id == trace_id
+                        )
+                    )
+                ).all()
+                link_rows = (
+                    await conn.execute(
+                        select(evaluation_links).where(
+                            evaluation_links.c.tenant_id == tenant.tenant_id,
+                            evaluation_links.c.trace_id == trace_id,
+                        )
+                    )
+                ).all()
+
+                links: list[EvaluationLinkRow] = []
+                for row in link_rows:
+                    link = apply_lazy_expiry(_row_to_link(row), now=now)
+                    if link.state != row.state:
+                        await conn.execute(
+                            update(evaluation_links)
+                            .where(
+                                evaluation_links.c.tenant_id == tenant.tenant_id,
+                                evaluation_links.c.evaluation_id == link.evaluation_id,
+                            )
+                            .values(state=link.state)
+                        )
+                    links.append(link)
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(f"could not read trace {trace_id!r}: {exc}") from exc
+
+        # Authorization (docs/storage-query.md: "Queries must not expose
+        # existence across tenants"): a span/link outside tenant's
+        # authorized project/application scope is excluded, same as
+        # get_reliability_event's own post-fetch check.
+        authorized_spans = [
+            _row_to_span(row)
+            for row in span_rows
+            if tenant.authorizes(row.project_id, row.application_id)
+        ]
+        authorized_links = [
+            link for link in links if tenant.authorizes(link.project_id, link.application_id)
+        ]
+        if not authorized_spans and not authorized_links:
+            return None
+
+        project_id = next((s.project_id for s in authorized_spans if s.project_id), None) or next(
+            (link.project_id for link in authorized_links if link.project_id), None
+        )
+        application_id = next(
+            (s.application_id for s in authorized_spans if s.application_id), None
+        ) or next((link.application_id for link in authorized_links if link.application_id), None)
+
+        evaluation_state = derive_trace_evaluation_state([link.state for link in authorized_links])
+
+        return AITrace(
+            tenant_id=tenant.tenant_id,
+            project_id=project_id,
+            application_id=application_id,
+            trace_id=trace_id,
+            started_at=min((s.started_at for s in authorized_spans), default=None),
+            ended_at=max((s.ended_at for s in authorized_spans), default=None),
+            spans=authorized_spans,
+            evaluation_links=[
+                EvaluationLink(
+                    evaluation_id=link.evaluation_id,
+                    span_id=link.span_id,
+                    state=EvaluationLinkState(link.state),
+                    first_received_at=link.first_received_at.isoformat(),
+                    expires_at=link.expires_at.isoformat() if link.expires_at is not None else None,
+                )
+                for link in authorized_links
+            ],
+            evaluation_state=EvaluationState(evaluation_state),
+        )
 
 
 def _aggregate_rows(rows: Sequence[Any]) -> list[CalibrationClassAggregate]:

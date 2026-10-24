@@ -6,15 +6,14 @@ Core throughout removes the temptation to leak one. Only `storage/postgres/*`
 may import this module (enforced by `pyproject.toml`'s import-linter
 contracts); `storage/backend.py` knows nothing about these column names.
 
-`reliability_events` is this pass's only table -- LOW_LEVEL_IMPLEMENTATION.md's
-full column list, minus the fields (`interaction_id`/`trace_id`/`span_id`
-joins against a `spans` table) that only matter once OBS-04's OTLP path and
-OBS-06's `spans`/`evaluation_links` tables exist. Building those now would
-mean guessing a shape ahead of a canonical `AITrace`/span contract, the same
-reason OBS-03 already deferred that model.
+`spans`/`evaluation_links` (2026-10-24, ADR-021) store the normalized span
+and evaluation-correlation state LOW_LEVEL_IMPLEMENTATION.md's table list
+already named; building them earlier would have meant guessing a shape
+ahead of the now-canonical `AITrace`/span contract, the same reason OBS-03
+originally deferred the model.
 """
 
-from sqlalchemy import Column, DateTime, Index, MetaData, String, Table
+from sqlalchemy import Boolean, Column, DateTime, Index, MetaData, String, Table
 from sqlalchemy.dialects.postgresql import JSONB
 
 metadata = MetaData()
@@ -58,4 +57,61 @@ reliability_events = Table(
     # this, every bounded-time-window query would be a full per-tenant
     # scan.
     Index("ix_reliability_events_tenant_occurred", "tenant_id", "occurred_at"),
+)
+
+spans = Table(
+    "spans",
+    metadata,
+    # ADR-021: (tenant_id, trace_id, span_id) is span identity.
+    Column("tenant_id", String(128), primary_key=True),
+    Column("trace_id", String(32), primary_key=True),
+    Column("span_id", String(16), primary_key=True),
+    Column("parent_span_id", String(16), nullable=True),
+    Column("project_id", String(128), nullable=True),
+    Column("application_id", String(128), nullable=True),
+    Column("operation_type", String(32), nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("ended_at", DateTime(timezone=True), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("interaction_id", String(128), nullable=True),
+    Column("evaluation_id", String(128), nullable=True),
+    Column("provider_id", String(128), nullable=True),
+    Column("model_id", String(128), nullable=True),
+    Column("model_version", String(128), nullable=True),
+    Column("usage_json", JSONB, nullable=False),
+    Column("resource_attributes_json", JSONB, nullable=False),
+    Column("extension_attributes_json", JSONB, nullable=False),
+    Column("mapping_version", String(64), nullable=False),
+    Column("semconv_version", String(32), nullable=False),
+    Column("schema_version", String(16), nullable=False),
+    # ADR-021: "Duplicate detection compares canonical normalized content."
+    # A SHA-256 hex digest of every persisted semantic field (never receipt
+    # time/processing counters/link state) lets an exact replay be detected
+    # as a cheap equality check instead of re-comparing every field on
+    # every insert attempt.
+    Column("content_hash", String(64), nullable=False),
+    Column("received_at", DateTime(timezone=True), nullable=False),
+    Index("ix_spans_tenant_trace", "tenant_id", "trace_id"),
+    Index("ix_spans_tenant_evaluation", "tenant_id", "evaluation_id"),
+)
+
+evaluation_links = Table(
+    "evaluation_links",
+    metadata,
+    # One link row per evaluation_id this process has any awareness of,
+    # from either arrival order (ADR-021: "Persist first-receipt time and
+    # absolute deadline for each unmatched evaluation event and each span
+    # with explicit evaluation intent").
+    Column("tenant_id", String(128), primary_key=True),
+    Column("evaluation_id", String(128), primary_key=True),
+    Column("project_id", String(128), nullable=True),
+    Column("application_id", String(128), nullable=True),
+    Column("trace_id", String(32), nullable=True),
+    Column("span_id", String(16), nullable=True),
+    Column("state", String(32), nullable=False),
+    Column("first_received_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=True),
+    Column("event_received", Boolean, nullable=False, server_default="false"),
+    Column("span_received", Boolean, nullable=False, server_default="false"),
+    Index("ix_evaluation_links_tenant_trace", "tenant_id", "trace_id"),
 )

@@ -11,6 +11,8 @@ parse every canonical fixture?) can run against the new schema, and so
 `storage/postgres/` has a real typed input once it needs one.
 """
 
+import hashlib
+import json
 import re
 from datetime import datetime
 from enum import Enum
@@ -126,3 +128,44 @@ class NormalizedSpan(BaseModel):
             if len(attrs) > MAX_BOUNDED_ATTRIBUTES:
                 raise ValueError(f"{name} exceeds the {MAX_BOUNDED_ATTRIBUTES}-key bound")
         return self
+
+    def canonical_content_hash(self) -> str:
+        """ADR-021: "Duplicate detection compares canonical normalized
+        content... Include all persisted semantic fields: tenant/project/
+        application scope, trace/span/parent IDs, interaction/evaluation
+        references, operation, timestamps, status, provider/model/version,
+        usage/cost provenance, normalized resource/extensions, and
+        mapping/semconv versions. Normalize absent optional fields
+        consistently; sort map keys but preserve ordered array values.
+        Receipt timestamps, processing counters and derived link state are
+        excluded."
+
+        `model_dump(mode="json")` on a field-sorted dict of exactly those
+        fields, hashed with SHA-256 -- an exact replay (byte-for-byte same
+        semantic content) always hashes identically; any semantic
+        difference, however small, does not."""
+        semantic_fields = {
+            "schema_version": self.schema_version,
+            "mapping_version": self.mapping_version,
+            "semconv_version": self.semconv_version,
+            "tenant_id": self.tenant_id,
+            "project_id": self.project_id,
+            "application_id": self.application_id,
+            "trace_id": self.trace_id,
+            "span_id": self.span_id,
+            "parent_span_id": self.parent_span_id,
+            "operation_type": self.operation_type.value,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "status": self.status.value,
+            "interaction_id": self.interaction_id,
+            "evaluation_id": self.evaluation_id,
+            "provider_id": self.provider_id,
+            "model_id": self.model_id,
+            "model_version": self.model_version,
+            "usage": self.usage.model_dump(mode="json"),
+            "resource_attributes": self.resource_attributes,
+            "extension_attributes": self.extension_attributes,
+        }
+        canonical = json.dumps(semantic_fields, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
