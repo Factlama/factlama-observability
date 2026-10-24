@@ -8,12 +8,12 @@ way any real future caller would have to.
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from schemas.tenancy import TenantContext
 from storage.postgres.backend import PostgresTelemetryStore
-from storage.postgres.tables import evaluation_links
+from storage.postgres.tables import evaluation_links, reliability_events
 from tests.conformance.conftest import make_event, make_span
 
 TENANT_A = TenantContext(tenant_id="tenant-a")
@@ -204,3 +204,46 @@ async def test_application_scoped_deletion_also_scopes_its_evaluation_link_delet
     assert deleted == 1
     assert not await _link_exists(engine, "tenant-a", "eval-a")
     assert await _link_exists(engine, "tenant-a", "eval-b")
+
+
+async def test_retention_never_deletes_an_expired_marker_even_once_fully_orphaned(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """R4 (review-evidence/g6-final-2026-10-24): a `RECONCILIATION_
+    EXPIRED` marker must never be deleted by this call, no matter how
+    old it or its source rows are -- deleting it is exactly what let a
+    replay of the identical old `(tenant_id, event_id)` (indistinguishable
+    from a brand-new event once its row is gone) recreate a fresh
+    `PENDING` link and complete normally, reviving a correlation that
+    must stay permanently expired."""
+    span = make_span(evaluation_id="eval-1", trace_id="0123456789abcdef0123456789abcdef")
+    event = make_event(evaluation_id="eval-1", trace_id=span.trace_id, span_id=span.span_id)
+    await store.record_reliability_event(event)
+
+    old = datetime.now(timezone.utc) - timedelta(days=3)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(evaluation_links).values(
+                first_received_at=old, expires_at=old + timedelta(hours=24)
+            )
+        )
+        await conn.execute(update(reliability_events).values(received_at=old))
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "RECONCILIATION_EXPIRED"
+
+    deleted = await store.delete_reliability_events(
+        "tenant-a", before=datetime.now(timezone.utc) - timedelta(days=1)
+    )
+    assert deleted == 1  # the stale source event is gone...
+    assert await _link_exists(engine, "tenant-a", "eval-1")  # ...but the marker is not
+
+    # A replay of the identical old event, plus its span, must not revive
+    # the correlation now that the marker is still there to block it.
+    await store.record_reliability_event(event)
+    await store.record_normalized_span(span)
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "RECONCILIATION_EXPIRED"

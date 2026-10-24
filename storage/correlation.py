@@ -110,23 +110,22 @@ def touch_link(
     this particular touch also conflicted."""
     existing = apply_lazy_expiry(existing, now=now)
 
-    if (
-        project_id is not None
-        and existing.project_id is not None
-        and project_id != existing.project_id
-    ):
+    # R2 (review-evidence/g6-final-2026-10-24): once a link has an
+    # established project/application scope, a touch must affirmatively
+    # match it -- a touch supplying *no* scope at all no longer passes
+    # silently. ADR-021: "missing scope is not a wildcard; evaluation ID
+    # alone does not authorize linking across scopes." Only a link with
+    # no established scope yet (`existing.project_id is None`) accepts
+    # any incoming value, including another None, as that first scope.
+    if existing.project_id is not None and project_id != existing.project_id:
         raise EvaluationLinkConflict(
-            f"evaluation {existing.evaluation_id!r}: project_id {project_id!r} disagrees with "
+            f"evaluation {existing.evaluation_id!r}: project_id {project_id!r} does not match "
             f"the link's established {existing.project_id!r}"
         )
-    if (
-        application_id is not None
-        and existing.application_id is not None
-        and application_id != existing.application_id
-    ):
+    if existing.application_id is not None and application_id != existing.application_id:
         raise EvaluationLinkConflict(
-            f"evaluation {existing.evaluation_id!r}: application_id {application_id!r} "
-            f"disagrees with the link's established {existing.application_id!r}"
+            f"evaluation {existing.evaluation_id!r}: application_id {application_id!r} does "
+            f"not match the link's established {existing.application_id!r}"
         )
 
     if existing.state == RECONCILIATION_EXPIRED:

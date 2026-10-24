@@ -7,8 +7,10 @@ layer, including both arrival orders and real transaction atomicity.
 
 import asyncio
 from datetime import timedelta
+from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncEngine
+import pytest
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from schemas.tenancy import TenantContext
 from storage.postgres.backend import PostgresTelemetryStore
@@ -156,6 +158,104 @@ async def test_get_trace_is_scoped_to_the_authenticated_tenant(
     other_tenant = TenantContext(tenant_id="tenant-b")
     trace = await store.get_trace(other_tenant, "0123456789abcdef0123456789abcdef")
     assert trace is None
+
+
+async def test_an_unscoped_event_cannot_attach_to_an_already_scoped_trace(
+    store: PostgresTelemetryStore,
+) -> None:
+    """R2 (review-evidence/g6-final-2026-10-24): missing scope is not a
+    wildcard -- an unscoped event naming only an evaluation_id must not
+    silently complete a link an already-scoped span established."""
+    span = make_span(
+        evaluation_id="eval-1",
+        trace_id="0123456789abcdef0123456789abcdef",
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    await store.record_normalized_span(span)
+    await store.record_reliability_event(make_event(evaluation_id="eval-1"))
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value != "AVAILABLE"
+
+
+@pytest.mark.parametrize("event_first", [False, True])
+async def test_an_event_can_link_a_span_lacking_an_evaluation_back_reference(
+    store: PostgresTelemetryStore, event_first: bool
+) -> None:
+    """R3 (review-evidence/g6-final-2026-10-24): a span naming no
+    evaluation_id at all must still correlate when an event names its
+    exact (tenant_id, trace_id, span_id) -- the spans table's own
+    primary key, an unambiguous reference -- in either arrival order."""
+    span = make_span(
+        trace_id="0123456789abcdef0123456789abcdef",
+        span_id="0123456789abcdef",
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id=span.trace_id,
+        span_id=span.span_id,
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    if event_first:
+        await store.record_reliability_event(event)
+        await store.record_normalized_span(span)
+    else:
+        await store.record_normalized_span(span)
+        await store.record_reliability_event(event)
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"
+
+
+async def test_concurrent_first_arrivals_both_contribute(
+    store: PostgresTelemetryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 (review-evidence/g6-final-2026-10-24): a bare SELECT-then-
+    INSERT/UPDATE previously let one concurrent first arrival's own
+    contribution vanish -- it lost the brand-new row's `ON CONFLICT DO
+    NOTHING` race and simply returned without ever touching the row the
+    other transaction won. Synchronizes the two real PostgreSQL inserts
+    into `evaluation_links` so the race is deterministic instead of
+    relying on scheduler luck."""
+    span = make_span(
+        evaluation_id="eval-1",
+        trace_id="0123456789abcdef0123456789abcdef",
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id=span.trace_id,
+        span_id=span.span_id,
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    original_execute = AsyncConnection.execute
+    barrier = asyncio.Barrier(2)  # type: ignore[attr-defined]
+    hits = 0
+
+    async def synchronized_execute(
+        self: AsyncConnection, statement: object, *args: Any, **kwargs: Any
+    ) -> Any:
+        nonlocal hits
+        sql = str(statement)
+        if "INSERT INTO evaluation_links" in sql and hits < 2:
+            hits += 1
+            await asyncio.wait_for(barrier.wait(), 5)
+        return await original_execute(self, statement, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(AsyncConnection, "execute", synchronized_execute)
+    await asyncio.gather(store.record_normalized_span(span), store.record_reliability_event(event))
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"
 
 
 async def test_get_trace_returns_none_for_an_unknown_trace(

@@ -100,7 +100,7 @@ def parse_span(
     """Raises `SpanParseError` for any structural or mapping problem with
     this one span."""
     try:
-        check_scope_agreement(
+        scope = check_scope_agreement(
             otlp_span.attributes,
             authenticated_tenant_id=tenant.tenant_id,
             authorized_project_id=tenant.project_id,
@@ -108,8 +108,18 @@ def parse_span(
         )
         mapped = map_span_attributes(otlp_span.attributes)
     except AttributeMappingConflict as exc:
+        # R6 (review-evidence/g6-final-2026-10-24): `exc`'s own message is
+        # already bounded/content-free (fixed at the source in
+        # otlp_attribute_mapping.py); this re-raise carries no additional
+        # submitted content.
         raise SpanParseError(str(exc)) from exc
 
+    # R7 (review-evidence/g6-final-2026-10-24): a missing protobuf
+    # start_time_unix_nano defaults to 0, which previously normalized to
+    # the Unix epoch and was accepted as a complete span -- corrupting
+    # trace timing/latency. Symmetric with the existing end-time check.
+    if otlp_span.start_time_unix_nano == 0:
+        raise SpanParseError("incomplete span: start_time_unix_nano is absent or zero")
     if otlp_span.end_time_unix_nano == 0:
         raise SpanParseError("incomplete span: end_time_unix_nano is absent or zero")
 
@@ -121,8 +131,14 @@ def parse_span(
             mapping_version=MAPPING_VERSION,
             semconv_version=SEMCONV_VERSION,
             tenant_id=tenant.tenant_id,
-            project_id=tenant.project_id,
-            application_id=tenant.application_id,
+            # R5 (review-evidence/g6-final-2026-10-24): the resolved scope
+            # (the credential's own narrower scope, else a validated
+            # attribute) -- not unconditionally `tenant.project_id`/
+            # `application_id`, which discarded an attribute-supplied
+            # scope whenever a tenant-wide credential authenticated the
+            # request.
+            project_id=scope.project_id,
+            application_id=scope.application_id,
             trace_id=_hex_id(otlp_span.trace_id),
             span_id=_hex_id(otlp_span.span_id),
             parent_span_id=_hex_id(otlp_span.parent_span_id) if otlp_span.parent_span_id else None,
@@ -144,4 +160,7 @@ def parse_span(
             extension_attributes=mapped.extension_attributes,
         )
     except ValidationError as exc:
-        raise SpanParseError(str(exc)) from exc
+        # R6: never echo pydantic's own error text, which can include the
+        # submitted input value verbatim -- a bounded, content-free code
+        # instead.
+        raise SpanParseError("span failed normalized-span validation") from exc

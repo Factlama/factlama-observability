@@ -74,6 +74,27 @@ class TestOperationType:
         with pytest.raises(AttributeMappingConflict):
             map_span_attributes([_kv("factlama.operation_type", "NOT_A_REAL_TYPE")])
 
+    def test_an_invalid_explicit_operation_type_does_not_echo_the_submitted_value(self) -> None:
+        """R6 (review-evidence/g6-final-2026-10-24): the submitted
+        attribute value is returned verbatim in OTLP partial_success
+        diagnostics to the same caller that submitted it -- the
+        response-body contract requires bounded, content-free error
+        text regardless, so the exception itself must never carry it."""
+        sentinel = "PRIVATE_CONTENT_12345"
+        with pytest.raises(AttributeMappingConflict) as excinfo:
+            map_span_attributes([_kv("factlama.operation_type", sentinel)])
+        assert sentinel not in str(excinfo.value)
+
+    def test_a_disagreeing_explicit_operation_type_does_not_echo_either_submitted_value(
+        self,
+    ) -> None:
+        with pytest.raises(AttributeMappingConflict) as excinfo:
+            map_span_attributes(
+                [_kv("gen_ai.operation.name", "chat"), _kv("factlama.operation_type", "TOOL")]
+            )
+        assert "chat" not in str(excinfo.value)
+        assert "TOOL" not in str(excinfo.value)
+
 
 class TestProviderAndModel:
     def test_provider_is_never_inferred_from_model_spelling(self) -> None:
@@ -221,3 +242,47 @@ class TestScopeAgreement:
             authorized_project_id=None,
             authorized_application_id=None,
         )
+
+    def test_a_tenant_wide_credentials_validated_attribute_is_the_resolved_scope(self) -> None:
+        """R5 (review-evidence/g6-final-2026-10-24): a tenant-wide
+        credential's own `None` must not be the final answer when a
+        validated attribute named a real scope -- the resolved scope is
+        what the caller actually stores the span under."""
+        resolved = check_scope_agreement(
+            [_kv("factlama.project_id", "proj-a"), _kv("factlama.application_id", "app-a")],
+            authenticated_tenant_id="tenant-a",
+            authorized_project_id=None,
+            authorized_application_id=None,
+        )
+        assert (resolved.project_id, resolved.application_id) == ("proj-a", "app-a")
+
+    def test_the_credentials_own_narrower_scope_is_preferred_over_an_agreeing_attribute(
+        self,
+    ) -> None:
+        resolved = check_scope_agreement(
+            [_kv("factlama.project_id", "proj-a")],
+            authenticated_tenant_id="tenant-a",
+            authorized_project_id="proj-a",
+            authorized_application_id=None,
+        )
+        assert resolved.project_id == "proj-a"
+
+    def test_no_attribute_and_no_credential_scope_resolves_to_unscoped(self) -> None:
+        resolved = check_scope_agreement(
+            [],
+            authenticated_tenant_id="tenant-a",
+            authorized_project_id=None,
+            authorized_application_id=None,
+        )
+        assert (resolved.project_id, resolved.application_id) == (None, None)
+
+    def test_a_project_attribute_disagreement_does_not_echo_either_submitted_value(self) -> None:
+        with pytest.raises(AttributeMappingConflict) as excinfo:
+            check_scope_agreement(
+                [_kv("factlama.project_id", "proj-b")],
+                authenticated_tenant_id="tenant-a",
+                authorized_project_id="proj-a",
+                authorized_application_id=None,
+            )
+        assert "proj-a" not in str(excinfo.value)
+        assert "proj-b" not in str(excinfo.value)

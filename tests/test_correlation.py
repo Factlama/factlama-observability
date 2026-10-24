@@ -180,13 +180,32 @@ class TestConflicts:
         )
         assert touched.project_id == "proj-a"
 
-    def test_an_unscoped_touch_does_not_conflict_with_an_established_scope(self) -> None:
-        """A side that simply does not mention project_id is not a
-        disagreement -- only an explicit, different value is."""
+    def test_an_unscoped_touch_conflicts_with_an_established_scope(self) -> None:
+        """R2 (review-evidence/g6-final-2026-10-24): missing scope is not
+        a wildcard -- a touch supplying no project_id at all does not
+        silently match (or advance) a link whose scope is already
+        established. Only a touch affirmatively naming the same scope
+        does."""
         link = _new(source="event", project_id="proj-a")
+        with pytest.raises(EvaluationLinkConflict):
+            touch_link(
+                link,
+                project_id=None,
+                application_id=None,
+                trace_id="trace-1",
+                span_id=None,
+                source="span",
+                now=NOW + timedelta(minutes=1),
+            )
+
+    def test_an_unscoped_touch_establishes_scope_on_a_previously_unscoped_link(self) -> None:
+        """The permissive side of the same rule: a link with no scope
+        established yet accepts whichever scope the next touch supplies,
+        including another unscoped touch."""
+        link = _new(source="event", project_id=None)
         touched = touch_link(
             link,
-            project_id=None,
+            project_id="proj-a",
             application_id=None,
             trace_id="trace-1",
             span_id=None,

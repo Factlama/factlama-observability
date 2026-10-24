@@ -19,6 +19,7 @@ from opentelemetry.proto.resource.v1.resource_pb2 import Resource
 from opentelemetry.proto.trace.v1.trace_pb2 import Span as OtlpSpan
 
 from collector.ingress.app import app, get_storage_readiness, get_telemetry_store
+from collector.ingress.otlp import SpanParseError, parse_span
 from collector.ingress.settings import Settings, get_settings
 from operations.tenant_credentials import TenantCredentialStore
 from schemas.normalized_span import NormalizedSpan
@@ -266,3 +267,82 @@ class TestMetrics:
             return 0.0
 
         assert _count(after) == _count(before) + 1
+
+
+class TestResolvedScope:
+    """R5 (review-evidence/g6-final-2026-10-24): `parse_span` must store
+    the resolved scope (the credential's own narrower scope, else a
+    validated attribute), not unconditionally the tenant credential's
+    own `project_id`/`application_id` -- which discarded an
+    attribute-supplied scope whenever a tenant-wide credential
+    authenticated the request."""
+
+    def test_a_tenant_wide_credentials_attribute_supplied_scope_is_preserved(self) -> None:
+        span = _make_span(
+            attributes={"factlama.project_id": "proj-a", "factlama.application_id": "app-a"}
+        )
+        parsed = parse_span(
+            span, resource_attributes={}, tenant=TenantContext(tenant_id="tenant-a")
+        )
+        assert (parsed.project_id, parsed.application_id) == ("proj-a", "app-a")
+
+    def test_a_scoped_credentials_own_scope_is_used_when_no_attribute_is_supplied(self) -> None:
+        span = _make_span()
+        parsed = parse_span(
+            span,
+            resource_attributes={},
+            tenant=TenantContext(tenant_id="tenant-a", project_id="proj-a"),
+        )
+        assert parsed.project_id == "proj-a"
+
+    def test_an_attribute_disagreeing_with_a_scoped_credential_is_still_rejected(self) -> None:
+        span = _make_span(attributes={"factlama.project_id": "proj-b"})
+        with pytest.raises(SpanParseError):
+            parse_span(
+                span,
+                resource_attributes={},
+                tenant=TenantContext(tenant_id="tenant-a", project_id="proj-a"),
+            )
+
+
+class TestStartTimestamp:
+    """R7 (review-evidence/g6-final-2026-10-24): a missing protobuf
+    `start_time_unix_nano` defaults to 0, which previously normalized to
+    the Unix epoch and was accepted as a complete span, symmetric with
+    the pre-existing end-time check."""
+
+    def test_a_zero_start_time_is_rejected_at_the_parser(self) -> None:
+        span = _make_span(start_nanos=0)
+        with pytest.raises(SpanParseError):
+            parse_span(span, resource_attributes={}, tenant=TenantContext(tenant_id="tenant-a"))
+
+    def test_a_zero_start_time_is_rejected_but_does_not_fail_the_batch(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        good = _make_span(span_id="0123456789abcdef")
+        zero_start = _make_span(span_id="1111111111111111", start_nanos=0)
+        body = _build_request_body([good, zero_start])
+        response = _post(client, body)
+        assert response.status_code == 200
+        parsed = _parse_response(response)
+        assert parsed.partial_success.rejected_spans == 1
+        assert len(store._spans) == 1
+
+
+class TestDiagnosticsPrivacy:
+    """R6 (review-evidence/g6-final-2026-10-24): `partial_success.
+    error_message` is returned to the same caller that submitted the
+    rejected span, but the response-body contract still requires
+    bounded, content-free text -- not an echo of the submitted
+    attribute value, which could be more than the caller intended to
+    expose (a buggy SDK auto-instrumenting sensitive content into an
+    attribute, for instance)."""
+
+    def test_an_invalid_operation_type_value_is_not_echoed_in_the_diagnostic(
+        self, client: TestClient
+    ) -> None:
+        sentinel = "PRIVATE_CONTENT_12345"
+        body = _build_request_body([_make_span(attributes={"factlama.operation_type": sentinel})])
+        response = _post(client, body)
+        parsed = _parse_response(response)
+        assert sentinel not in parsed.partial_success.error_message

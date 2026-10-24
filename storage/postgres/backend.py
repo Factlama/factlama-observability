@@ -46,6 +46,8 @@ from storage.aggregates import (
 )
 from storage.backend import TelemetryStore
 from storage.correlation import (
+    PENDING,
+    RECONCILIATION_EXPIRED,
     EvaluationLinkConflict,
     EvaluationLinkRow,
     apply_lazy_expiry,
@@ -267,6 +269,42 @@ class PostgresTelemetryStore(TelemetryStore):
                         source="event",
                         now=received_at,
                     )
+                    # R3 (review-evidence/g6-final-2026-10-24): an event
+                    # naming an exact (tenant_id, trace_id, span_id) --
+                    # the spans table's own primary key, so this lookup is
+                    # unambiguous -- correlates to that span even when the
+                    # span itself carries no evaluation_id back-reference.
+                    # Touching a second time with source="span" reuses the
+                    # same merge/conflict logic the span's own touch would
+                    # have applied if it had carried the reference itself.
+                    if event.trace_id is not None and event.span_id is not None:
+                        matched_span = (
+                            await conn.execute(
+                                select(spans.c.project_id, spans.c.application_id).where(
+                                    spans.c.tenant_id == event.tenant_id,
+                                    spans.c.trace_id == event.trace_id,
+                                    spans.c.span_id == event.span_id,
+                                )
+                            )
+                        ).first()
+                        if matched_span is not None:
+                            # Representing the span's own actual scope here
+                            # (not the event's) keeps this consistent with
+                            # what the span's own native touch would have
+                            # supplied -- an unscoped event must not cause
+                            # an already-established scoped link to look
+                            # unscoped.
+                            await self._touch_evaluation_link(
+                                conn,
+                                tenant_id=event.tenant_id,
+                                evaluation_id=event.evaluation_id,
+                                project_id=matched_span.project_id,
+                                application_id=matched_span.application_id,
+                                trace_id=event.trace_id,
+                                span_id=event.span_id,
+                                source="span",
+                                now=received_at,
+                            )
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not record reliability event {event.event_id!r}: {exc}"
@@ -290,38 +328,61 @@ class PostgresTelemetryStore(TelemetryStore):
         and never affects whether the caller's own event/span insert
         succeeds -- a scope/reference conflict here is logged and the
         touch is dropped, except for a lazy-expiry flip, which is always
-        persisted even then. A benign race with a concurrent first touch
-        for the same brand-new `(tenant_id, evaluation_id)` resolves via
-        `ON CONFLICT DO NOTHING`: the loser's own touch information is
-        not applied this time, but any later touch still reconciles
-        correctly -- an accepted consequence of the lazy, no-scheduler
-        design, not a correctness gap this pass needs to close."""
-        existing_row = (
-            await conn.execute(
-                select(evaluation_links).where(
-                    evaluation_links.c.tenant_id == tenant_id,
-                    evaluation_links.c.evaluation_id == evaluation_id,
-                )
-            )
-        ).first()
+        persisted even then.
 
-        if existing_row is None:
-            link = new_link(
-                tenant_id=tenant_id,
-                evaluation_id=evaluation_id,
-                project_id=project_id,
-                application_id=application_id,
-                trace_id=trace_id,
-                span_id=span_id,
-                source=source,  # type: ignore[arg-type]
-                now=now,
-                window=self._reconciliation_window,
-            )
+        R1 (review-evidence/g6-final-2026-10-24): a bare SELECT-then-
+        INSERT/UPDATE previously let a concurrent first arrival's own
+        contribution vanish -- it lost the `ON CONFLICT DO NOTHING` race
+        for a brand-new row and simply returned without ever applying
+        its own flag to the row the other transaction won. This now
+        always attempts the insert first. If it wins, this transaction
+        created the row with its own contribution already in it, done.
+        If it loses, Postgres's own unique-index conflict check blocks
+        this statement until the winning transaction commits (or rolls
+        back) -- so by the time we resume, the winning row is guaranteed
+        committed and visible. The following `SELECT ... FOR UPDATE` then
+        locks it before merging, serializing against any other
+        concurrent toucher of the same identity for the rest of this
+        transaction, so no update here is ever lost to another one
+        in flight."""
+        link = new_link(
+            tenant_id=tenant_id,
+            evaluation_id=evaluation_id,
+            project_id=project_id,
+            application_id=application_id,
+            trace_id=trace_id,
+            span_id=span_id,
+            source=source,  # type: ignore[arg-type]
+            now=now,
+            window=self._reconciliation_window,
+        )
+        inserted = (
             await conn.execute(
                 pg_insert(evaluation_links)
                 .values(**_link_to_row(link))
                 .on_conflict_do_nothing(index_elements=["tenant_id", "evaluation_id"])
+                .returning(evaluation_links.c.tenant_id)
             )
+        ).first()
+        if inserted is not None:
+            return  # this transaction created the row fresh; nothing more to merge
+
+        existing_row = (
+            await conn.execute(
+                select(evaluation_links)
+                .where(
+                    evaluation_links.c.tenant_id == tenant_id,
+                    evaluation_links.c.evaluation_id == evaluation_id,
+                )
+                .with_for_update()
+            )
+        ).first()
+        if existing_row is None:
+            # The insert conflicted, so a row must exist -- a concurrent
+            # delete between the conflict and this read would be the
+            # only way here, which `delete_reliability_events` never
+            # does within an overlapping window (it only ever removes a
+            # fully-orphaned marker, never one a touch just created).
             return
 
         existing = _row_to_link(existing_row)
@@ -460,17 +521,33 @@ class PostgresTelemetryStore(TelemetryStore):
     ) -> int:
         """Coordinated retention (docs/storage-query.md, ADR-021): deletes
         this tenant's `reliability_events` rows older than `before`, plus
-        any now-eligible `spans` and `evaluation_links` rows, all in one
-        transaction -- never on independent per-table cutoffs, since
-        dropping an `evaluation_links` marker while its source record (or
-        a still-live redelivery of it) remains is exactly what would let
-        a later replay revive an already-expired correlation. An
-        `evaluation_links` row is only ever removed once nothing with its
-        identity remains in either source table, and even then only once
-        the marker itself is at least as old as this same cutoff -- so a
-        link still legitimately waiting on its other half is never
-        dropped early. The returned count is `reliability_events` rows
-        deleted only, unchanged from before this coordination existed.
+        any now-eligible `spans` and non-expired `evaluation_links` rows,
+        all in one transaction -- never on independent per-table cutoffs,
+        since dropping an `evaluation_links` marker while its source
+        record (or a still-live redelivery of it) remains is exactly
+        what would let a later replay revive an already-expired
+        correlation. A `PENDING`/`AVAILABLE` `evaluation_links` row is
+        only ever removed once nothing with its identity remains in
+        either source table, and even then only once the marker itself
+        is at least as old as this same cutoff -- so a link still
+        legitimately waiting on its other half is never dropped early.
+
+        R4 (review-evidence/g6-final-2026-10-24): a `RECONCILIATION_
+        EXPIRED` marker is never deleted by this call at all, regardless
+        of how old it or its source rows are. Deleting it, even once its
+        source rows are also gone, is exactly what let a replay of the
+        identical old `(tenant_id, event_id)` -- indistinguishable from
+        a brand-new event once its row is gone -- recreate a fresh
+        `PENDING` link and complete normally, reviving a correlation
+        ADR-021 requires to stay permanently expired. There is currently
+        no implemented bound on how long a caller might still replay an
+        old identity, so the only sound policy is to retain every
+        expired marker indefinitely until a real, separately-tested
+        replay-horizon mechanism exists to retire them -- the `before`
+        cutoff below applies only to `reliability_events`/`spans`, never
+        to a `RECONCILIATION_EXPIRED` row. ADR-021 itself anticipates
+        exactly this: "retain bounded expiry markers for as long as the
+        corresponding source/identity can be replayed."
         """
         event_clauses: list[ColumnElement[bool]] = [
             reliability_events.c.tenant_id == tenant_id,
@@ -483,6 +560,7 @@ class PostgresTelemetryStore(TelemetryStore):
         link_clauses: list[ColumnElement[bool]] = [
             evaluation_links.c.tenant_id == tenant_id,
             evaluation_links.c.first_received_at < before,
+            evaluation_links.c.state != RECONCILIATION_EXPIRED,
             ~exists(
                 select(1).where(
                     reliability_events.c.tenant_id == evaluation_links.c.tenant_id,
@@ -507,6 +585,22 @@ class PostgresTelemetryStore(TelemetryStore):
             link_clauses.append(evaluation_links.c.application_id == application_id)
         try:
             async with self._engine.begin() as conn:
+                # Normalize state first: a link past its deadline that
+                # nothing has touched/read yet still literally stores
+                # PENDING (lazy expiry is only applied on a touch or a
+                # read) -- without this, `state != RECONCILIATION_EXPIRED`
+                # below would not catch it, reopening R4's exact hole for
+                # a row simply nobody happened to touch recently.
+                await conn.execute(
+                    update(evaluation_links)
+                    .where(
+                        evaluation_links.c.tenant_id == tenant_id,
+                        evaluation_links.c.state == PENDING,
+                        evaluation_links.c.expires_at.isnot(None),
+                        evaluation_links.c.expires_at <= datetime.now(timezone.utc),
+                    )
+                    .values(state=RECONCILIATION_EXPIRED)
+                )
                 event_result = await conn.execute(delete(reliability_events).where(*event_clauses))
                 await conn.execute(delete(spans).where(*span_clauses))
                 # The marker goes last: by the time this runs, the source
@@ -553,18 +647,52 @@ class PostgresTelemetryStore(TelemetryStore):
                         if existing is not None and existing.content_hash == content_hash
                         else SpanRecordOutcome.CONFLICT
                     )
-                if outcome != SpanRecordOutcome.CONFLICT and span.evaluation_id is not None:
-                    await self._touch_evaluation_link(
-                        conn,
-                        tenant_id=span.tenant_id,
-                        evaluation_id=span.evaluation_id,
-                        project_id=span.project_id,
-                        application_id=span.application_id,
-                        trace_id=span.trace_id,
-                        span_id=span.span_id,
-                        source="span",
-                        now=received_at,
-                    )
+                if outcome != SpanRecordOutcome.CONFLICT:
+                    if span.evaluation_id is not None:
+                        await self._touch_evaluation_link(
+                            conn,
+                            tenant_id=span.tenant_id,
+                            evaluation_id=span.evaluation_id,
+                            project_id=span.project_id,
+                            application_id=span.application_id,
+                            trace_id=span.trace_id,
+                            span_id=span.span_id,
+                            source="span",
+                            now=received_at,
+                        )
+                    # R3 (review-evidence/g6-final-2026-10-24): a span
+                    # carrying no evaluation_id back-reference at all can
+                    # still be the exact span an already-stored event
+                    # named by (tenant_id, trace_id, span_id) -- look up
+                    # any evaluation_links row(s) referencing this exact
+                    # identity and touch each one, the same way the span
+                    # would have if it had carried the reference itself.
+                    reverse_clauses: list[ColumnElement[bool]] = [
+                        evaluation_links.c.tenant_id == span.tenant_id,
+                        evaluation_links.c.trace_id == span.trace_id,
+                        evaluation_links.c.span_id == span.span_id,
+                    ]
+                    if span.evaluation_id is not None:
+                        reverse_clauses.append(
+                            evaluation_links.c.evaluation_id != span.evaluation_id
+                        )
+                    matched_links = (
+                        await conn.execute(
+                            select(evaluation_links.c.evaluation_id).where(*reverse_clauses)
+                        )
+                    ).all()
+                    for matched_link in matched_links:
+                        await self._touch_evaluation_link(
+                            conn,
+                            tenant_id=span.tenant_id,
+                            evaluation_id=matched_link.evaluation_id,
+                            project_id=span.project_id,
+                            application_id=span.application_id,
+                            trace_id=span.trace_id,
+                            span_id=span.span_id,
+                            source="span",
+                            now=received_at,
+                        )
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not record span {span.span_id!r} for trace {span.trace_id!r}: {exc}"

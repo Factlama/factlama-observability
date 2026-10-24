@@ -101,14 +101,19 @@ def _map_operation_type(attrs: dict[str, AnyValue]) -> str:
 
     explicit = _str_value(attrs.get("factlama.operation_type"))
     if explicit is not None:
+        # R6 (review-evidence/g6-final-2026-10-24): never interpolate the
+        # submitted attribute value into this message -- it is returned
+        # verbatim to the same caller in OTLP's partial_success diagnostics
+        # (collector/ingress/app.py), and the response-body contract
+        # requires bounded, content-free error text regardless of audience.
         if explicit not in VALID_OPERATION_TYPES:
             raise AttributeMappingConflict(
-                f"factlama.operation_type {explicit!r} is not a recognized operation type"
+                "factlama.operation_type does not match a recognized operation type"
             )
         if recognized_from_genai is not None and explicit != recognized_from_genai:
             raise AttributeMappingConflict(
-                f"factlama.operation_type {explicit!r} disagrees with gen_ai.operation.name "
-                f"{gen_ai_operation!r} (recognized as {recognized_from_genai!r})"
+                "factlama.operation_type disagrees with the operation type inferred from "
+                "gen_ai.operation.name"
             )
         return explicit
 
@@ -164,30 +169,42 @@ def map_span_attributes(attributes: Iterable[KeyValue]) -> MappedSpanAttributes:
     )
 
 
+@dataclass(frozen=True)
+class ResolvedScope:
+    """The project/application scope a span should actually be stored
+    under -- the credential's own narrower scope when it has one, else
+    a validated attribute naming one (R5, review-evidence/
+    g6-final-2026-10-24): a tenant-wide credential's `None` is not
+    itself the answer, it just means this attribute, once checked for
+    disagreement, is free to supply it."""
+
+    project_id: str | None
+    application_id: str | None
+
+
 def check_scope_agreement(
     attributes: Iterable[KeyValue],
     *,
     authenticated_tenant_id: str,
     authorized_project_id: str | None,
     authorized_application_id: str | None,
-) -> None:
+) -> ResolvedScope:
     """ADR-021: `factlama.tenant_id` never establishes identity --
     `authenticated_tenant_id` already came from the trusted credential,
     never from this span. `factlama.project_id`/`application_id` are
     "required authorized scope, supplied by trusted credential scope or
     validated attributes" -- when the credential itself is already
     narrowed to a project/application, an attribute naming a different
-    one is a conflict, not a silent override. Raises
-    `AttributeMappingConflict` on any disagreement; returns `None`
-    otherwise (including when an attribute is simply absent)."""
+    one is a conflict, not a silent override; when the credential is
+    tenant-wide, a validated attribute is the scope the span is stored
+    under, not discarded in favor of the credential's own `None`.
+    Raises `AttributeMappingConflict` on any disagreement."""
     attrs = _as_dict(attributes)
 
     tenant_attr = _str_value(attrs.get("factlama.tenant_id"))
     if tenant_attr is not None and tenant_attr != authenticated_tenant_id:
-        raise AttributeMappingConflict(
-            f"factlama.tenant_id {tenant_attr!r} disagrees with the authenticated tenant "
-            f"{authenticated_tenant_id!r}"
-        )
+        # R6: bounded, content-free -- never echoes the submitted value.
+        raise AttributeMappingConflict("factlama.tenant_id disagrees with the authenticated tenant")
 
     project_attr = _str_value(attrs.get("factlama.project_id"))
     if (
@@ -195,10 +212,7 @@ def check_scope_agreement(
         and authorized_project_id is not None
         and project_attr != authorized_project_id
     ):
-        raise AttributeMappingConflict(
-            f"factlama.project_id {project_attr!r} disagrees with the authorized project "
-            f"{authorized_project_id!r}"
-        )
+        raise AttributeMappingConflict("factlama.project_id disagrees with the authorized project")
 
     application_attr = _str_value(attrs.get("factlama.application_id"))
     if (
@@ -207,6 +221,12 @@ def check_scope_agreement(
         and application_attr != authorized_application_id
     ):
         raise AttributeMappingConflict(
-            f"factlama.application_id {application_attr!r} disagrees with the authorized "
-            f"application {authorized_application_id!r}"
+            "factlama.application_id disagrees with the authorized application"
         )
+
+    return ResolvedScope(
+        project_id=authorized_project_id if authorized_project_id is not None else project_attr,
+        application_id=(
+            authorized_application_id if authorized_application_id is not None else application_attr
+        ),
+    )
