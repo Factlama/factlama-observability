@@ -5,14 +5,32 @@ yet -- every test here passes its own explicit `before` cutoff, the same
 way any real future caller would have to.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from schemas.tenancy import TenantContext
 from storage.postgres.backend import PostgresTelemetryStore
-from tests.conformance.conftest import make_event
+from storage.postgres.tables import evaluation_links
+from tests.conformance.conftest import make_event, make_span
 
 TENANT_A = TenantContext(tenant_id="tenant-a")
 TENANT_B = TenantContext(tenant_id="tenant-b")
+
+
+async def _link_exists(engine: AsyncEngine, tenant_id: str, evaluation_id: str) -> bool:
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                select(evaluation_links.c.evaluation_id).where(
+                    evaluation_links.c.tenant_id == tenant_id,
+                    evaluation_links.c.evaluation_id == evaluation_id,
+                )
+            )
+        ).first()
+    return row is not None
 
 
 def _after_insert_cutoff() -> datetime:
@@ -87,3 +105,102 @@ async def test_deleting_with_no_matching_rows_returns_zero(
         "tenant-with-no-data", before=datetime.now(timezone.utc)
     )
     assert deleted == 0
+
+
+async def test_deleting_a_reliability_event_also_removes_its_orphaned_evaluation_link(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """docs/storage-query.md's coordinated-retention rule: a source
+    record and the `evaluation_links` marker keyed to its identity are
+    retired together, not left behind on an independent cutoff."""
+    await store.record_reliability_event(make_event(event_id="e1", evaluation_id="eval-1"))
+    assert await _link_exists(engine, "tenant-a", "eval-1")
+
+    deleted = await store.delete_reliability_events("tenant-a", before=_after_insert_cutoff())
+
+    assert deleted == 1
+    assert not await _link_exists(engine, "tenant-a", "eval-1")
+
+
+async def test_a_links_marker_is_not_deleted_while_its_source_event_is_still_in_scope(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """A different application's event sharing the same evaluation_id is
+    out of this deletion's scope and must survive -- and so must the
+    marker keyed to that still-live identity, even though the marker row
+    itself has no project/application filter protecting it directly."""
+    await store.record_reliability_event(
+        make_event(
+            event_id="e1", evaluation_id="eval-1", project_id="proj-a", application_id="app-a"
+        )
+    )
+    cutoff = _after_insert_cutoff()
+
+    deleted = await store.delete_reliability_events(
+        "tenant-a", before=cutoff, project_id="proj-a", application_id="app-b"
+    )
+
+    assert deleted == 0
+    assert await _link_exists(engine, "tenant-a", "eval-1")
+
+
+async def test_a_links_marker_is_not_deleted_while_a_matching_span_still_exists(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """The event half of a link can be gone while a late-but-still-live
+    span sharing its trace/span identity remains -- the marker must wait
+    for that span too, not just the event."""
+    await store.record_reliability_event(
+        make_event(
+            event_id="e1",
+            evaluation_id="eval-1",
+            trace_id="0123456789abcdef0123456789abcdef",
+            span_id="0123456789abcdef",
+        )
+    )
+    # The cutoff must land strictly between the event's and the span's own
+    # `received_at` -- sleeping past it before recording the span is what
+    # makes the span, unlike the event, land *after* the cutoff.
+    cutoff = datetime.now(timezone.utc) + timedelta(milliseconds=50)
+    await asyncio.sleep(0.1)
+    await store.record_normalized_span(
+        make_span(
+            trace_id="0123456789abcdef0123456789abcdef",
+            span_id="0123456789abcdef",
+            evaluation_id="eval-1",
+        )
+    )
+
+    deleted = await store.delete_reliability_events("tenant-a", before=cutoff)
+
+    assert deleted == 1  # the event is gone...
+    assert await _link_exists(
+        engine, "tenant-a", "eval-1"
+    )  # ...but the span still protects the marker
+
+
+async def test_application_scoped_deletion_also_scopes_its_evaluation_link_deletion(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """Coordination must respect the same scope filter the caller passed
+    -- an application-scoped delete removes only that application's
+    orphaned marker, never a sibling application's."""
+    await store.record_reliability_event(
+        make_event(
+            event_id="e1", evaluation_id="eval-a", project_id="proj-a", application_id="app-a"
+        )
+    )
+    await store.record_reliability_event(
+        make_event(
+            event_id="e2", evaluation_id="eval-b", project_id="proj-a", application_id="app-b"
+        )
+    )
+    cutoff = _after_insert_cutoff()
+
+    deleted = await store.delete_reliability_events(
+        "tenant-a", before=cutoff, project_id="proj-a", application_id="app-a"
+    )
+
+    assert deleted == 1
+    assert not await _link_exists(engine, "tenant-a", "eval-a")
+    assert await _link_exists(engine, "tenant-a", "eval-b")

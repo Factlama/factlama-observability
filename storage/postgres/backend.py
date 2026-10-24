@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from asyncpg import PostgresError  # type: ignore[import-untyped]
-from sqlalchemy import delete, literal, select, tuple_, update
+from sqlalchemy import delete, exists, literal, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -458,23 +458,66 @@ class PostgresTelemetryStore(TelemetryStore):
         project_id: str | None = None,
         application_id: str | None = None,
     ) -> int:
-        clauses: list[ColumnElement[bool]] = [
+        """Coordinated retention (docs/storage-query.md, ADR-021): deletes
+        this tenant's `reliability_events` rows older than `before`, plus
+        any now-eligible `spans` and `evaluation_links` rows, all in one
+        transaction -- never on independent per-table cutoffs, since
+        dropping an `evaluation_links` marker while its source record (or
+        a still-live redelivery of it) remains is exactly what would let
+        a later replay revive an already-expired correlation. An
+        `evaluation_links` row is only ever removed once nothing with its
+        identity remains in either source table, and even then only once
+        the marker itself is at least as old as this same cutoff -- so a
+        link still legitimately waiting on its other half is never
+        dropped early. The returned count is `reliability_events` rows
+        deleted only, unchanged from before this coordination existed.
+        """
+        event_clauses: list[ColumnElement[bool]] = [
             reliability_events.c.tenant_id == tenant_id,
             reliability_events.c.received_at < before,
         ]
+        span_clauses: list[ColumnElement[bool]] = [
+            spans.c.tenant_id == tenant_id,
+            spans.c.received_at < before,
+        ]
+        link_clauses: list[ColumnElement[bool]] = [
+            evaluation_links.c.tenant_id == tenant_id,
+            evaluation_links.c.first_received_at < before,
+            ~exists(
+                select(1).where(
+                    reliability_events.c.tenant_id == evaluation_links.c.tenant_id,
+                    reliability_events.c.evaluation_id == evaluation_links.c.evaluation_id,
+                )
+            ),
+            ~exists(
+                select(1).where(
+                    spans.c.tenant_id == evaluation_links.c.tenant_id,
+                    spans.c.trace_id == evaluation_links.c.trace_id,
+                    spans.c.span_id == evaluation_links.c.span_id,
+                )
+            ),
+        ]
         if project_id is not None:
-            clauses.append(reliability_events.c.project_id == project_id)
+            event_clauses.append(reliability_events.c.project_id == project_id)
+            span_clauses.append(spans.c.project_id == project_id)
+            link_clauses.append(evaluation_links.c.project_id == project_id)
         if application_id is not None:
-            clauses.append(reliability_events.c.application_id == application_id)
-        stmt = delete(reliability_events).where(*clauses)
+            event_clauses.append(reliability_events.c.application_id == application_id)
+            span_clauses.append(spans.c.application_id == application_id)
+            link_clauses.append(evaluation_links.c.application_id == application_id)
         try:
             async with self._engine.begin() as conn:
-                result = await conn.execute(stmt)
+                event_result = await conn.execute(delete(reliability_events).where(*event_clauses))
+                await conn.execute(delete(spans).where(*span_clauses))
+                # The marker goes last: by the time this runs, the source
+                # rows it could still be protecting have already been
+                # removed above within this same transaction.
+                await conn.execute(delete(evaluation_links).where(*link_clauses))
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not delete reliability events for tenant {tenant_id!r}: {exc}"
             ) from exc
-        return result.rowcount
+        return event_result.rowcount
 
     async def record_normalized_span(self, span: NormalizedSpan) -> SpanRecordOutcome:
         content_hash = span.canonical_content_hash()
