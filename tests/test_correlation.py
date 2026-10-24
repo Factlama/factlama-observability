@@ -14,9 +14,13 @@ from storage.correlation import (
     RECONCILIATION_EXPIRED,
     EvaluationLinkConflict,
     EvaluationLinkRow,
+    LinkIdentity,
+    SpanIdentity,
     apply_lazy_expiry,
     derive_trace_evaluation_state,
     new_link,
+    select_unique_matching_link,
+    select_unique_matching_span,
     touch_link,
 )
 
@@ -198,21 +202,40 @@ class TestConflicts:
                 now=NOW + timedelta(minutes=1),
             )
 
-    def test_an_unscoped_touch_establishes_scope_on_a_previously_unscoped_link(self) -> None:
-        """The permissive side of the same rule: a link with no scope
-        established yet accepts whichever scope the next touch supplies,
-        including another unscoped touch."""
+    def test_a_touch_matching_the_links_established_unscoped_state_succeeds(self) -> None:
+        """The permissive side of the same rule: a touch matching the
+        link's own established state -- unscoped matching unscoped --
+        still succeeds. Only a *different* value is a conflict."""
         link = _new(source="event", project_id=None)
         touched = touch_link(
             link,
-            project_id="proj-a",
+            project_id=None,
             application_id=None,
             trace_id="trace-1",
             span_id=None,
             source="span",
             now=NOW + timedelta(minutes=1),
         )
-        assert touched.project_id == "proj-a"
+        assert touched.project_id is None
+
+    def test_a_scoped_touch_conflicts_with_an_established_unscoped_link(self) -> None:
+        """F1 (review-evidence/g6-fix-followup-2026-10-24): a link's
+        scope, once established at creation -- even as unscoped -- is
+        immutable. A later scoped touch cannot retroactively supply
+        scope the first toucher never provided; this is the same rule
+        as the already-scoped case above, just in the other direction,
+        and must hold regardless of which side arrives first."""
+        link = _new(source="event", project_id=None)
+        with pytest.raises(EvaluationLinkConflict):
+            touch_link(
+                link,
+                project_id="proj-a",
+                application_id=None,
+                trace_id="trace-1",
+                span_id=None,
+                source="span",
+                now=NOW + timedelta(minutes=1),
+            )
 
 
 class TestDeriveTraceEvaluationState:
@@ -233,3 +256,111 @@ class TestDeriveTraceEvaluationState:
 
     def test_all_available_is_available(self) -> None:
         assert derive_trace_evaluation_state([AVAILABLE, AVAILABLE]) == AVAILABLE
+
+
+class TestSelectUniqueMatchingSpan:
+    """F2 (review-evidence/g6-fix-followup-2026-10-24): ADR-021's
+    "a trace-level event can link using trace_id alone within the
+    authorized scope" -- `required_span_id=None` is that case."""
+
+    def test_an_exact_span_id_match_with_compatible_scope_is_selected(self) -> None:
+        candidates = [SpanIdentity(span_id="s1", project_id="p", application_id="a")]
+        matched = select_unique_matching_span(
+            link_project_id="p",
+            link_application_id="a",
+            required_span_id="s1",
+            candidates=candidates,
+        )
+        assert matched is not None and matched.span_id == "s1"
+
+    def test_a_trace_level_reference_matches_the_sole_scope_compatible_span(self) -> None:
+        candidates = [SpanIdentity(span_id="s1", project_id="p", application_id="a")]
+        matched = select_unique_matching_span(
+            link_project_id="p",
+            link_application_id="a",
+            required_span_id=None,
+            candidates=candidates,
+        )
+        assert matched is not None and matched.span_id == "s1"
+
+    def test_a_trace_level_reference_with_multiple_candidates_is_ambiguous(self) -> None:
+        candidates = [
+            SpanIdentity(span_id="s1", project_id="p", application_id="a"),
+            SpanIdentity(span_id="s2", project_id="p", application_id="a"),
+        ]
+        matched = select_unique_matching_span(
+            link_project_id="p",
+            link_application_id="a",
+            required_span_id=None,
+            candidates=candidates,
+        )
+        assert matched is None
+
+    def test_a_scope_mismatch_is_never_selected_even_if_otherwise_unique(self) -> None:
+        candidates = [SpanIdentity(span_id="s1", project_id="other", application_id=None)]
+        matched = select_unique_matching_span(
+            link_project_id="p",
+            link_application_id="a",
+            required_span_id=None,
+            candidates=candidates,
+        )
+        assert matched is None
+
+    def test_no_candidates_selects_nothing(self) -> None:
+        matched = select_unique_matching_span(
+            link_project_id="p", link_application_id="a", required_span_id=None, candidates=[]
+        )
+        assert matched is None
+
+    def test_missing_scope_on_both_sides_is_a_compatible_match(self) -> None:
+        candidates = [SpanIdentity(span_id="s1", project_id=None, application_id=None)]
+        matched = select_unique_matching_span(
+            link_project_id=None,
+            link_application_id=None,
+            required_span_id=None,
+            candidates=candidates,
+        )
+        assert matched is not None and matched.span_id == "s1"
+
+
+class TestSelectUniqueMatchingLink:
+    def test_a_trace_level_link_matches_the_arriving_span(self) -> None:
+        candidates = [
+            LinkIdentity(evaluation_id="eval-1", span_id=None, project_id="p", application_id="a")
+        ]
+        matched = select_unique_matching_link(
+            span_id="s1", span_project_id="p", span_application_id="a", candidates=candidates
+        )
+        assert matched is not None and matched.evaluation_id == "eval-1"
+
+    def test_an_exact_span_id_match_is_selected_over_an_unrelated_trace_level_link(self) -> None:
+        candidates = [
+            LinkIdentity(
+                evaluation_id="eval-exact", span_id="s1", project_id="p", application_id="a"
+            ),
+        ]
+        matched = select_unique_matching_link(
+            span_id="s1", span_project_id="p", span_application_id="a", candidates=candidates
+        )
+        assert matched is not None and matched.evaluation_id == "eval-exact"
+
+    def test_a_link_naming_a_different_span_id_is_not_selected(self) -> None:
+        candidates = [
+            LinkIdentity(
+                evaluation_id="eval-1", span_id="other-span", project_id="p", application_id="a"
+            ),
+        ]
+        matched = select_unique_matching_link(
+            span_id="s1", span_project_id="p", span_application_id="a", candidates=candidates
+        )
+        assert matched is None
+
+    def test_two_trace_level_candidates_are_ambiguous(self) -> None:
+        candidates = [
+            LinkIdentity(evaluation_id="eval-1", span_id=None, project_id="p", application_id="a"),
+            LinkIdentity(evaluation_id="eval-2", span_id=None, project_id="p", application_id="a"),
+        ]
+        matched = select_unique_matching_link(
+            span_id="s1", span_project_id="p", span_application_id="a", candidates=candidates
+        )
+        assert matched is None

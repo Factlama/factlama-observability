@@ -17,6 +17,7 @@ contracted retryable 503.
 
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -46,13 +47,18 @@ from storage.aggregates import (
 )
 from storage.backend import TelemetryStore
 from storage.correlation import (
+    AVAILABLE,
     PENDING,
     RECONCILIATION_EXPIRED,
     EvaluationLinkConflict,
     EvaluationLinkRow,
+    LinkIdentity,
+    SpanIdentity,
     apply_lazy_expiry,
     derive_trace_evaluation_state,
     new_link,
+    select_unique_matching_link,
+    select_unique_matching_span,
     touch_link,
 )
 from storage.errors import StorageUnavailableError
@@ -258,7 +264,7 @@ class PostgresTelemetryStore(TelemetryStore):
                     # link, from either arrival order. Only a *new* insert
                     # touches it -- a replay of an already-stored event
                     # must not re-advance correlation state a second time.
-                    await self._touch_evaluation_link(
+                    link = await self._touch_evaluation_link(
                         conn,
                         tenant_id=event.tenant_id,
                         evaluation_id=event.evaluation_id,
@@ -269,31 +275,43 @@ class PostgresTelemetryStore(TelemetryStore):
                         source="event",
                         now=received_at,
                     )
-                    # R3 (review-evidence/g6-final-2026-10-24): an event
-                    # naming an exact (tenant_id, trace_id, span_id) --
-                    # the spans table's own primary key, so this lookup is
-                    # unambiguous -- correlates to that span even when the
-                    # span itself carries no evaluation_id back-reference.
-                    # Touching a second time with source="span" reuses the
-                    # same merge/conflict logic the span's own touch would
-                    # have applied if it had carried the reference itself.
-                    if event.trace_id is not None and event.span_id is not None:
-                        matched_span = (
+                    # R3/F2 (review-evidence/g6-final-2026-10-24 and
+                    # g6-fix-followup-2026-10-24): an event naming a
+                    # trace -- an exact span_id if it has one, or ADR-021's
+                    # "trace-level event ... using trace_id alone" if it
+                    # does not -- correlates to a span even when the span
+                    # itself carries no evaluation_id back-reference.
+                    # Candidates are filtered against the *link's own
+                    # established scope* (never the event's own, which may
+                    # be absent or may not even be what finally won this
+                    # link if a concurrent touch set it) -- a trace-level
+                    # reference with more than one scope-compatible
+                    # candidate is ambiguous and is never guessed.
+                    if event.trace_id is not None and link is not None:
+                        candidate_rows = (
                             await conn.execute(
-                                select(spans.c.project_id, spans.c.application_id).where(
+                                select(
+                                    spans.c.span_id, spans.c.project_id, spans.c.application_id
+                                ).where(
                                     spans.c.tenant_id == event.tenant_id,
                                     spans.c.trace_id == event.trace_id,
-                                    spans.c.span_id == event.span_id,
                                 )
                             )
-                        ).first()
+                        ).all()
+                        matched_span = select_unique_matching_span(
+                            link_project_id=link.project_id,
+                            link_application_id=link.application_id,
+                            required_span_id=event.span_id,
+                            candidates=[
+                                SpanIdentity(row.span_id, row.project_id, row.application_id)
+                                for row in candidate_rows
+                            ],
+                        )
                         if matched_span is not None:
                             # Representing the span's own actual scope here
                             # (not the event's) keeps this consistent with
                             # what the span's own native touch would have
-                            # supplied -- an unscoped event must not cause
-                            # an already-established scoped link to look
-                            # unscoped.
+                            # supplied.
                             await self._touch_evaluation_link(
                                 conn,
                                 tenant_id=event.tenant_id,
@@ -301,7 +319,7 @@ class PostgresTelemetryStore(TelemetryStore):
                                 project_id=matched_span.project_id,
                                 application_id=matched_span.application_id,
                                 trace_id=event.trace_id,
-                                span_id=event.span_id,
+                                span_id=matched_span.span_id,
                                 source="span",
                                 now=received_at,
                             )
@@ -323,12 +341,16 @@ class PostgresTelemetryStore(TelemetryStore):
         span_id: str | None,
         source: str,
         now: datetime,
-    ) -> None:
+    ) -> EvaluationLinkRow | None:
         """Best-effort correlation side effect (ADR-021): never raises,
         and never affects whether the caller's own event/span insert
         succeeds -- a scope/reference conflict here is logged and the
         touch is dropped, except for a lazy-expiry flip, which is always
-        persisted even then.
+        persisted even then. Returns the link's resulting row (its
+        established scope is what a caller doing trace-level matching
+        afterwards must filter candidates by -- never the touch's own
+        possibly-incompatible input), or `None` only in the pathological
+        case noted below.
 
         R1 (review-evidence/g6-final-2026-10-24): a bare SELECT-then-
         INSERT/UPDATE previously let a concurrent first arrival's own
@@ -365,7 +387,7 @@ class PostgresTelemetryStore(TelemetryStore):
             )
         ).first()
         if inserted is not None:
-            return  # this transaction created the row fresh; nothing more to merge
+            return link  # this transaction created the row fresh; nothing more to merge
 
         existing_row = (
             await conn.execute(
@@ -383,7 +405,7 @@ class PostgresTelemetryStore(TelemetryStore):
             # only way here, which `delete_reliability_events` never
             # does within an overlapping window (it only ever removes a
             # fully-orphaned marker, never one a touch just created).
-            return
+            return None
 
         existing = _row_to_link(existing_row)
         try:
@@ -408,7 +430,8 @@ class PostgresTelemetryStore(TelemetryStore):
                     )
                     .values(state=expired.state)
                 )
-            return
+                return expired
+            return existing
 
         link_values = _link_to_row(updated)
         del link_values["tenant_id"], link_values["evaluation_id"]
@@ -420,6 +443,7 @@ class PostgresTelemetryStore(TelemetryStore):
             )
             .values(**link_values)
         )
+        return updated
 
     async def get_reliability_event(
         self, tenant: TenantContext, evaluation_id: str
@@ -660,28 +684,42 @@ class PostgresTelemetryStore(TelemetryStore):
                             source="span",
                             now=received_at,
                         )
-                    # R3 (review-evidence/g6-final-2026-10-24): a span
-                    # carrying no evaluation_id back-reference at all can
-                    # still be the exact span an already-stored event
-                    # named by (tenant_id, trace_id, span_id) -- look up
-                    # any evaluation_links row(s) referencing this exact
-                    # identity and touch each one, the same way the span
-                    # would have if it had carried the reference itself.
-                    reverse_clauses: list[ColumnElement[bool]] = [
-                        evaluation_links.c.tenant_id == span.tenant_id,
-                        evaluation_links.c.trace_id == span.trace_id,
-                        evaluation_links.c.span_id == span.span_id,
-                    ]
-                    if span.evaluation_id is not None:
-                        reverse_clauses.append(
-                            evaluation_links.c.evaluation_id != span.evaluation_id
-                        )
-                    matched_links = (
+                    # R3/F2 (review-evidence/g6-final-2026-10-24 and
+                    # g6-fix-followup-2026-10-24): a span carrying no
+                    # evaluation_id back-reference at all can still be
+                    # the span an already-stored event is waiting for --
+                    # either one naming this exact span_id, or ADR-021's
+                    # "trace-level event ... using trace_id alone" (a
+                    # link with no span_id yet). Candidates are filtered
+                    # against *this span's own* scope; more than one
+                    # scope-compatible trace-level candidate is ambiguous
+                    # and is never guessed.
+                    candidate_rows = (
                         await conn.execute(
-                            select(evaluation_links.c.evaluation_id).where(*reverse_clauses)
+                            select(
+                                evaluation_links.c.evaluation_id,
+                                evaluation_links.c.span_id,
+                                evaluation_links.c.project_id,
+                                evaluation_links.c.application_id,
+                            ).where(
+                                evaluation_links.c.tenant_id == span.tenant_id,
+                                evaluation_links.c.trace_id == span.trace_id,
+                            )
                         )
                     ).all()
-                    for matched_link in matched_links:
+                    matched_link = select_unique_matching_link(
+                        span_id=span.span_id,
+                        span_project_id=span.project_id,
+                        span_application_id=span.application_id,
+                        candidates=[
+                            LinkIdentity(
+                                row.evaluation_id, row.span_id, row.project_id, row.application_id
+                            )
+                            for row in candidate_rows
+                            if row.evaluation_id != span.evaluation_id
+                        ],
+                    )
+                    if matched_link is not None:
                         await self._touch_evaluation_link(
                             conn,
                             tenant_id=span.tenant_id,
@@ -719,17 +757,57 @@ class PostgresTelemetryStore(TelemetryStore):
                     )
                 ).all()
 
+                span_candidates = [
+                    SpanIdentity(row.span_id, row.project_id, row.application_id)
+                    for row in span_rows
+                ]
+
                 links: list[EvaluationLinkRow] = []
                 for row in link_rows:
                     link = apply_lazy_expiry(_row_to_link(row), now=now)
-                    if link.state != row.state:
+                    # F3 (review-evidence/g6-fix-followup-2026-10-24): a
+                    # concurrent write-time lookup can miss its
+                    # counterpart under ordinary read-committed isolation
+                    # -- each transaction only sees what was already
+                    # committed when its own lookup ran, so two truly
+                    # concurrent inserts can each finish seeing nothing
+                    # to match, with nothing left to retry it afterwards.
+                    # The next read is this lazy design's own recovery
+                    # point, the same way lazy expiry already is. Only
+                    # ever looks for a missing *span*-side confirmation --
+                    # an event's own touch always marks its own side
+                    # directly within its own transaction, with no
+                    # equivalent visibility race on that side.
+                    if link.state == PENDING and not link.span_received:
+                        matched_span = select_unique_matching_span(
+                            link_project_id=link.project_id,
+                            link_application_id=link.application_id,
+                            required_span_id=link.span_id,
+                            candidates=span_candidates,
+                        )
+                        if matched_span is not None:
+                            link = replace(
+                                link,
+                                span_id=link.span_id or matched_span.span_id,
+                                span_received=True,
+                                state=AVAILABLE if link.event_received else link.state,
+                            )
+                    if (
+                        link.state != row.state
+                        or link.span_received != row.span_received
+                        or link.span_id != row.span_id
+                    ):
                         await conn.execute(
                             update(evaluation_links)
                             .where(
                                 evaluation_links.c.tenant_id == tenant.tenant_id,
                                 evaluation_links.c.evaluation_id == link.evaluation_id,
                             )
-                            .values(state=link.state)
+                            .values(
+                                state=link.state,
+                                span_received=link.span_received,
+                                span_id=link.span_id,
+                            )
                         )
                     links.append(link)
         except (SQLAlchemyError, OSError, PostgresError) as exc:

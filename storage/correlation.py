@@ -110,19 +110,23 @@ def touch_link(
     this particular touch also conflicted."""
     existing = apply_lazy_expiry(existing, now=now)
 
-    # R2 (review-evidence/g6-final-2026-10-24): once a link has an
-    # established project/application scope, a touch must affirmatively
-    # match it -- a touch supplying *no* scope at all no longer passes
-    # silently. ADR-021: "missing scope is not a wildcard; evaluation ID
-    # alone does not authorize linking across scopes." Only a link with
-    # no established scope yet (`existing.project_id is None`) accepts
-    # any incoming value, including another None, as that first scope.
-    if existing.project_id is not None and project_id != existing.project_id:
+    # R2/F1 (review-evidence/g6-final-2026-10-24 and
+    # g6-fix-followup-2026-10-24): a link's project/application scope is
+    # fixed forever at whatever its very first toucher supplied --
+    # `new_link`, never here -- including when that first value was
+    # itself `None`. Every later touch must match it exactly, `None`
+    # included: filling an empty field from a later touch is not proof
+    # the earlier source belonged to that scope, and accepting it would
+    # let an unscoped arrival -- whichever side happened to go first --
+    # be silently claimed by a scoped one. ADR-021: "missing scope is
+    # not a wildcard; evaluation ID alone does not authorize linking
+    # across scopes," applied independently of arrival order.
+    if project_id != existing.project_id:
         raise EvaluationLinkConflict(
             f"evaluation {existing.evaluation_id!r}: project_id {project_id!r} does not match "
             f"the link's established {existing.project_id!r}"
         )
-    if existing.application_id is not None and application_id != existing.application_id:
+    if application_id != existing.application_id:
         raise EvaluationLinkConflict(
             f"evaluation {existing.evaluation_id!r}: application_id {application_id!r} does "
             f"not match the link's established {existing.application_id!r}"
@@ -167,6 +171,76 @@ def touch_link(
     if updated.event_received and updated.span_received:
         return replace(updated, state=AVAILABLE)
     return updated
+
+
+@dataclass(frozen=True)
+class SpanIdentity:
+    """The minimal shape of one stored span this module needs to decide
+    whether it is the span a link is waiting for -- never the full
+    `NormalizedSpan`, to keep this module DB/schema-type-free."""
+
+    span_id: str
+    project_id: str | None
+    application_id: str | None
+
+
+@dataclass(frozen=True)
+class LinkIdentity:
+    """The minimal shape of one stored `evaluation_links` row this
+    module needs to decide whether a span is the one it is waiting for."""
+
+    evaluation_id: str
+    span_id: str | None
+    project_id: str | None
+    application_id: str | None
+
+
+def select_unique_matching_span(
+    *,
+    link_project_id: str | None,
+    link_application_id: str | None,
+    required_span_id: str | None,
+    candidates: list[SpanIdentity],
+) -> SpanIdentity | None:
+    """F2/F3 (review-evidence/g6-fix-followup-2026-10-24): ADR-021 --
+    "A matching trace_id plus span_id, when present, must identify a
+    span in that trace. A trace-level event can link using trace_id
+    alone within the authorized scope." `required_span_id=None` is
+    exactly that trace-level case: any candidate in the trace is
+    eligible as long as its scope exactly matches the link's own
+    established scope (ADR-021: missing scope is not a wildcard, so a
+    `None` must match `None`, never any other value). Returns the one
+    compatible candidate; zero or more than one is ambiguous and is
+    never guessed."""
+    matches = [
+        candidate
+        for candidate in candidates
+        if candidate.project_id == link_project_id
+        and candidate.application_id == link_application_id
+        and (required_span_id is None or candidate.span_id == required_span_id)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def select_unique_matching_link(
+    *,
+    span_id: str,
+    span_project_id: str | None,
+    span_application_id: str | None,
+    candidates: list[LinkIdentity],
+) -> LinkIdentity | None:
+    """The reverse of `select_unique_matching_span`: which of this
+    trace's `evaluation_links` rows -- each either already naming this
+    exact span or still trace-level-only (`span_id is None`) -- is the
+    one this span resolves, if exactly one is scope-compatible."""
+    matches = [
+        candidate
+        for candidate in candidates
+        if candidate.project_id == span_project_id
+        and candidate.application_id == span_application_id
+        and (candidate.span_id is None or candidate.span_id == span_id)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def derive_trace_evaluation_state(link_states: list[str]) -> str:

@@ -263,3 +263,96 @@ async def test_get_trace_returns_none_for_an_unknown_trace(
 ) -> None:
     trace = await store.get_trace(TENANT_A, "00000000000000000000000000000001")
     assert trace is None
+
+
+async def test_an_unscoped_event_arriving_first_cannot_authorize_a_scoped_link(
+    store: PostgresTelemetryStore,
+) -> None:
+    """F1 (review-evidence/g6-fix-followup-2026-10-24): the reverse
+    arrival order of the original R2 reproduction -- an unscoped event
+    establishes the link first, then a scoped span arrives naming the
+    same evaluation_id. The event never provided scope or an
+    authoritative trace/span reference, so it must not complete
+    regardless of which side happened to go first."""
+    event = make_event(evaluation_id="eval-1")
+    await store.record_reliability_event(event)
+
+    span = make_span(evaluation_id="eval-1", project_id="proj-a", application_id="app-a")
+    await store.record_normalized_span(span)
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value != "AVAILABLE"
+
+
+@pytest.mark.parametrize("event_first", [False, True])
+async def test_a_trace_level_event_links_to_its_traces_sole_scoped_span(
+    store: PostgresTelemetryStore, event_first: bool
+) -> None:
+    """F2 (review-evidence/g6-fix-followup-2026-10-24): ADR-021 -- "A
+    trace-level event can link using trace_id alone within the
+    authorized scope." An event naming only trace_id (no span_id) must
+    link to the single scope-compatible span in that trace, even though
+    the span itself carries no evaluation_id back-reference, in either
+    arrival order."""
+    span = make_span(project_id="proj-a", application_id="app-a")
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id=span.trace_id,
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    if event_first:
+        await store.record_reliability_event(event)
+        await store.record_normalized_span(span)
+    else:
+        await store.record_normalized_span(span)
+        await store.record_reliability_event(event)
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"
+
+
+async def test_concurrent_exact_reference_without_a_span_backreference_still_links(
+    store: PostgresTelemetryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3 (review-evidence/g6-fix-followup-2026-10-24): the insert-first
+    lock protects a *shared* evaluation_links identity, but a span
+    lacking evaluation_id never touches that identity directly -- its
+    reverse lookup can miss the event's still-uncommitted link, and the
+    event's forward lookup can symmetrically miss the span's still-
+    uncommitted row, under ordinary read-committed isolation. Both
+    sources still commit successfully; nothing before this fix ever
+    reconciled the miss afterwards. Synchronizes both real PostgreSQL
+    lookups while each side's counterpart insert is still uncommitted;
+    `get_trace`'s own lazy reconciliation on read is what must catch
+    this, not the write path alone."""
+    span = make_span(project_id="proj-a", application_id="app-a")
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id=span.trace_id,
+        span_id=span.span_id,
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    original_execute = AsyncConnection.execute
+    barrier = asyncio.Barrier(2)  # type: ignore[attr-defined]
+    hits = 0
+
+    async def synchronized_execute(
+        self: AsyncConnection, statement: object, *args: Any, **kwargs: Any
+    ) -> Any:
+        nonlocal hits
+        sql = str(statement)
+        if ("FROM spans" in sql or "FROM evaluation_links" in sql) and hits < 2:
+            hits += 1
+            await asyncio.wait_for(barrier.wait(), 5)
+        return await original_execute(self, statement, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(AsyncConnection, "execute", synchronized_execute)
+    await asyncio.gather(store.record_normalized_span(span), store.record_reliability_event(event))
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"
