@@ -35,6 +35,19 @@ DEFAULT_OTLP_MAX_SPANS_PER_BATCH = 1_000
 DEFAULT_DB_COMMAND_TIMEOUT = 10.0
 DEFAULT_DB_POOL_TIMEOUT = 30.0
 
+# R5 (review-evidence/g6-coverage-review-2026-10-25): "one caller can
+# consume the entire [global] cap and reject other tenants" -- a
+# separate, smaller per-tenant slice of DEFAULT_MAX_CONCURRENT_REQUESTS,
+# enforced in addition to (never instead of) the existing global cap.
+DEFAULT_MAX_CONCURRENT_REQUESTS_PER_TENANT = 5
+
+# R5: "neither [command_timeout nor pool_timeout] establishes an overall
+# HTTP request deadline." Generous relative to DB-layer timeouts above
+# (a request can legitimately make more than one DB call) but still
+# finite -- no route may run forever regardless of how many individual
+# calls it makes.
+DEFAULT_REQUEST_DEADLINE_SECONDS = 30.0
+
 
 class Settings:
     """Process-wide ingress settings, read once from the environment."""
@@ -74,6 +87,15 @@ class Settings:
         )
         self.db_pool_timeout_seconds = float(
             optional_env("FACTLAMA_DB_POOL_TIMEOUT_SECONDS", str(DEFAULT_DB_POOL_TIMEOUT))
+        )
+        self.max_concurrent_requests_per_tenant = int(
+            optional_env(
+                "FACTLAMA_MAX_CONCURRENT_REQUESTS_PER_TENANT",
+                str(DEFAULT_MAX_CONCURRENT_REQUESTS_PER_TENANT),
+            )
+        )
+        self.request_deadline_seconds = float(
+            optional_env("FACTLAMA_REQUEST_DEADLINE_SECONDS", str(DEFAULT_REQUEST_DEADLINE_SECONDS))
         )
 
 

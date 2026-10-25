@@ -14,9 +14,10 @@ independent, tenant-facing reader of the same storage, not part of the
 internal ingestion path.
 """
 
+import asyncio
 import hmac
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
@@ -24,7 +25,7 @@ from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from operations.concurrency import ConcurrencyLimiter
+from operations.concurrency import ConcurrencyLimiter, PerTenantConcurrencyLimiter
 from operations.metrics import install_metrics
 from query.api.bootstrap import check_storage_ready, lifespan
 from query.api.cursor import CursorError, decode_cursor, encode_cursor
@@ -44,6 +45,16 @@ install_metrics(app, build_version="0.1")
 # the query service had no equivalent cap at all. Same plain in-flight
 # counter, same fail-fast-never-queue rationale (`operations/concurrency.py`).
 app.state.concurrency_limiter = ConcurrencyLimiter(get_settings().max_concurrent_requests)
+# R5 (review-evidence/g6-coverage-review-2026-10-25): the limiter above is
+# one global counter applied before tenant authentication -- "one caller
+# can consume the entire cap and reject other tenants." Separate
+# per-tenant admission control, wired as a route dependency
+# (`enforce_tenant_concurrency_limit` below), not a middleware, since it
+# needs the `TenantContext` a route's own auth dependency resolves.
+app.state.tenant_concurrency_limiter = PerTenantConcurrencyLimiter(
+    get_settings().max_concurrent_requests_per_tenant
+)
+app.state.request_deadline_seconds = get_settings().request_deadline_seconds
 
 _EXEMPT_FROM_CONCURRENCY_LIMIT = frozenset({"/health/live", "/health/ready", "/metrics"})
 
@@ -66,6 +77,25 @@ async def _enforce_concurrency_limit(
         return await call_next(request)
     finally:
         await limiter.exit()
+
+
+@app.middleware("http")
+async def _enforce_request_deadline(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """R5: "neither [command_timeout nor pool_timeout] establishes an
+    overall HTTP request deadline." Mirrors
+    `collector/ingress/app.py`'s own middleware exactly."""
+    if request.url.path in _EXEMPT_FROM_CONCURRENCY_LIMIT:
+        return await call_next(request)
+    deadline: float = request.app.state.request_deadline_seconds
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=deadline)
+    except TimeoutError:
+        error = QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "request exceeded its deadline; retry shortly"
+        )
+        return JSONResponse(status_code=error.status_code, content=error.to_body())
 
 
 # OBS-07 stage-3 (2026-10-23): bounded page size and bounded time window --
@@ -117,6 +147,25 @@ def authenticate(
     if tenant_context is None:
         raise QueryError(QueryErrorCode.UNAUTHENTICATED, "missing or invalid API key")
     return tenant_context
+
+
+async def enforce_tenant_concurrency_limit(
+    request: Request, tenant_context: Annotated[TenantContext, Depends(authenticate)]
+) -> AsyncIterator[None]:
+    """R5: the per-tenant counterpart to `_enforce_concurrency_limit`'s
+    global cap -- mirrors `collector/ingress/app.py`'s own dependency
+    exactly. FastAPI caches `Depends(authenticate)` per request, so this
+    does not re-run authentication a second time."""
+    limiter: PerTenantConcurrencyLimiter = request.app.state.tenant_concurrency_limiter
+    if not await limiter.try_enter(tenant_context.tenant_id):
+        raise QueryError(
+            QueryErrorCode.RATE_LIMITED,
+            "too many concurrent requests for this tenant; retry shortly",
+        )
+    try:
+        yield
+    finally:
+        await limiter.exit(tenant_context.tenant_id)
 
 
 def authenticate_admin(
@@ -186,6 +235,7 @@ def _resolve_window(since: str | None, until: str | None) -> tuple[datetime, dat
 @app.get("/v0.1/ai/evaluations")
 async def list_evaluations(
     tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
     store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
     settings: Annotated[Settings, Depends(get_settings)],
     since: str | None = None,
@@ -271,6 +321,7 @@ async def list_evaluations(
 @app.get("/v0.1/ai/evaluations/aggregates")
 async def get_evaluation_aggregates(
     tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
     store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
     since: str | None = None,
     until: str | None = None,
@@ -341,6 +392,7 @@ async def get_evaluation_aggregates(
 async def get_evaluation(
     evaluation_id: str,
     tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
     store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
 ) -> JSONResponse:
     try:
@@ -358,6 +410,7 @@ async def get_evaluation(
 async def get_trace(
     trace_id: str,
     tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
     store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
 ) -> JSONResponse:
     """ADR-021: the `AITrace` read projection -- spans plus evaluation

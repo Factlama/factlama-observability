@@ -20,6 +20,16 @@ DEFAULT_DB_POOL_TIMEOUT = 30.0
 # Same default as collector/ingress/settings.py's DEFAULT_MAX_CONCURRENT_REQUESTS.
 DEFAULT_MAX_CONCURRENT_REQUESTS = 20
 
+# R5 (review-evidence/g6-coverage-review-2026-10-25): "one caller can
+# consume the entire [global] cap and reject other tenants" -- a
+# separate, smaller per-tenant slice, enforced in addition to (never
+# instead of) the existing global cap above.
+DEFAULT_MAX_CONCURRENT_REQUESTS_PER_TENANT = 5
+
+# R5: "neither [command_timeout nor pool_timeout] establishes an overall
+# HTTP request deadline."
+DEFAULT_REQUEST_DEADLINE_SECONDS = 30.0
+
 
 class Settings:
     """Process-wide query API settings, read once from the environment."""
@@ -41,6 +51,15 @@ class Settings:
         )
         self.max_concurrent_requests = int(
             optional_env("FACTLAMA_MAX_CONCURRENT_REQUESTS", str(DEFAULT_MAX_CONCURRENT_REQUESTS))
+        )
+        self.max_concurrent_requests_per_tenant = int(
+            optional_env(
+                "FACTLAMA_MAX_CONCURRENT_REQUESTS_PER_TENANT",
+                str(DEFAULT_MAX_CONCURRENT_REQUESTS_PER_TENANT),
+            )
+        )
+        self.request_deadline_seconds = float(
+            optional_env("FACTLAMA_REQUEST_DEADLINE_SECONDS", str(DEFAULT_REQUEST_DEADLINE_SECONDS))
         )
         # G6_FINAL_REVIEW_2026-10-24.md's "trace usage summaries and
         # retention operational horizon need itemized acceptance" gap --

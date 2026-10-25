@@ -6,6 +6,7 @@ correctness is proven against a live PostgreSQL by
 `tests/conformance/test_trace_correlation.py`, not re-tested here.
 """
 
+import asyncio
 from collections.abc import Iterator
 
 import httpx
@@ -21,6 +22,7 @@ from opentelemetry.proto.trace.v1.trace_pb2 import Span as OtlpSpan
 from collector.ingress.app import app, get_storage_readiness, get_telemetry_store
 from collector.ingress.otlp import SpanParseError, parse_span
 from collector.ingress.settings import Settings, get_settings
+from operations.concurrency import PerTenantConcurrencyLimiter
 from operations.tenant_credentials import TenantCredentialStore
 from schemas.normalized_span import NormalizedSpan
 from schemas.tenancy import TenantContext
@@ -28,6 +30,7 @@ from storage.errors import StorageUnavailableError
 from storage.spans import SpanRecordOutcome
 
 API_KEY = "test-tenant-key"
+TENANT_B_API_KEY = "test-tenant-b-key"
 TRACE_ID = "0123456789abcdef0123456789abcdef"
 SPAN_ID = "0123456789abcdef"
 
@@ -73,7 +76,12 @@ def _test_settings() -> Settings:
     settings.max_body_bytes = 1_000_000
     settings.otlp_max_body_bytes = 4 * 1024 * 1024
     settings.otlp_max_spans_per_batch = 1_000
-    settings.tenant_store = TenantCredentialStore({API_KEY: TenantContext(tenant_id="tenant-a")})
+    settings.tenant_store = TenantCredentialStore(
+        {
+            API_KEY: TenantContext(tenant_id="tenant-a"),
+            TENANT_B_API_KEY: TenantContext(tenant_id="tenant-b"),
+        }
+    )
     settings.database_url = None
     return settings
 
@@ -250,6 +258,51 @@ class TestStorageOutage:
         response = _post(client, body)
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+
+
+class TestPerTenantConcurrency:
+    """R5 (review-evidence/g6-coverage-review-2026-10-25): "one caller
+    can consume the entire [global] cap and reject other tenants." A
+    saturated tenant-a must be rejected while tenant-b is still
+    admitted -- the global `TestBackpressure` cap above cannot
+    distinguish them."""
+
+    def _saturate_tenant_a(self) -> PerTenantConcurrencyLimiter:
+        original = app.state.tenant_concurrency_limiter
+        app.state.tenant_concurrency_limiter = PerTenantConcurrencyLimiter(
+            max_concurrent_per_tenant=1
+        )
+        entered = asyncio.run(app.state.tenant_concurrency_limiter.try_enter("tenant-a"))
+        assert entered is True
+        return original
+
+    def test_a_saturated_tenant_is_rejected(self, client: TestClient) -> None:
+        original = self._saturate_tenant_a()
+        try:
+            response = _post(client, _build_request_body([_make_span()]), token=API_KEY)
+            assert response.status_code == 429
+            assert response.json()["error"]["code"] == "RATE_LIMITED"
+        finally:
+            app.state.tenant_concurrency_limiter = original
+
+    def test_a_different_tenant_is_still_admitted(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        original = self._saturate_tenant_a()
+        try:
+            response = _post(client, _build_request_body([_make_span()]), token=TENANT_B_API_KEY)
+            assert response.status_code == 200
+        finally:
+            app.state.tenant_concurrency_limiter = original
+
+    def test_exit_frees_the_tenants_own_slot(self, client: TestClient) -> None:
+        original = self._saturate_tenant_a()
+        try:
+            asyncio.run(app.state.tenant_concurrency_limiter.exit("tenant-a"))
+            response = _post(client, _build_request_body([_make_span()]), token=API_KEY)
+            assert response.status_code == 200
+        finally:
+            app.state.tenant_concurrency_limiter = original
 
 
 class TestMetrics:

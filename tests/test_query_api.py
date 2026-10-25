@@ -17,7 +17,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from operations.concurrency import ConcurrencyLimiter
+from operations.concurrency import ConcurrencyLimiter, PerTenantConcurrencyLimiter
 from operations.tenant_credentials import TenantCredentialStore
 from query.api.app import app, get_storage_readiness, get_telemetry_store
 from query.api.settings import Settings, get_settings
@@ -725,6 +725,73 @@ class TestBackpressure:
             assert response.status_code == 404
         finally:
             app.state.concurrency_limiter = original
+
+
+class TestPerTenantConcurrency:
+    """R5 (review-evidence/g6-coverage-review-2026-10-25): "one caller
+    can consume the entire [global] cap and reject other tenants." A
+    saturated tenant-one must be rejected while tenant-two is still
+    admitted -- the global `TestBackpressure` cap above cannot
+    distinguish them."""
+
+    def _saturate_tenant_one(self) -> PerTenantConcurrencyLimiter:
+        original = app.state.tenant_concurrency_limiter
+        app.state.tenant_concurrency_limiter = PerTenantConcurrencyLimiter(
+            max_concurrent_per_tenant=1
+        )
+        entered = asyncio.run(app.state.tenant_concurrency_limiter.try_enter("tenant-one"))
+        assert entered is True
+        return original
+
+    def test_a_saturated_tenant_is_rejected(self, client: TestClient) -> None:
+        original = self._saturate_tenant_one()
+        try:
+            response = _get(client, "no-such-eval", token=TENANT_ONE_KEY)
+            assert response.status_code == 429
+            assert response.json()["error"]["code"] == "RATE_LIMITED"
+        finally:
+            app.state.tenant_concurrency_limiter = original
+
+    def test_a_different_tenant_is_still_admitted(self, client: TestClient) -> None:
+        original = self._saturate_tenant_one()
+        try:
+            response = _get(client, "no-such-eval", token=TENANT_TWO_KEY)
+            assert response.status_code == 404  # admitted; just no such evaluation
+        finally:
+            app.state.tenant_concurrency_limiter = original
+
+    def test_exit_frees_the_tenants_own_slot(self, client: TestClient) -> None:
+        original = self._saturate_tenant_one()
+        try:
+            asyncio.run(app.state.tenant_concurrency_limiter.exit("tenant-one"))
+            response = _get(client, "no-such-eval", token=TENANT_ONE_KEY)
+            assert response.status_code == 404
+        finally:
+            app.state.tenant_concurrency_limiter = original
+
+
+class TestRequestDeadline:
+    """R5: "neither [command_timeout nor pool_timeout] establishes an
+    overall HTTP request deadline." A route whose own handling outlasts
+    the deadline must fail bounded, not hang."""
+
+    def test_a_slow_route_is_bounded_by_the_deadline(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        original = app.state.request_deadline_seconds
+        app.state.request_deadline_seconds = 0.05
+
+        async def _slow_get_trace(tenant: TenantContext, trace_id: str) -> None:
+            await asyncio.sleep(0.2)
+            return None
+
+        store.get_trace = _slow_get_trace  # type: ignore[method-assign]
+        try:
+            response = _get_trace(client, "0" * 32, token=TENANT_ONE_KEY)
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        finally:
+            app.state.request_deadline_seconds = original
 
 
 class TestMetrics:

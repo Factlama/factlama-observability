@@ -6,8 +6,9 @@ receiver, once blocked on a canonical `AITrace`/span schema that now
 exists in `contracts/v0.1`.
 """
 
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Request, Response
@@ -26,7 +27,7 @@ from collector.ingress.otlp import (
     parse_span,
 )
 from collector.ingress.settings import Settings, get_settings
-from operations.concurrency import ConcurrencyLimiter
+from operations.concurrency import ConcurrencyLimiter, PerTenantConcurrencyLimiter
 from operations.metrics import install_metrics
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
@@ -81,6 +82,21 @@ DROPPED_ATTRIBUTES_TOTAL = Counter(
 # route's own `Depends`) cannot be overridden through FastAPI's dependency
 # injection.
 app.state.concurrency_limiter = ConcurrencyLimiter(get_settings().max_concurrent_requests)
+# R5 (review-evidence/g6-coverage-review-2026-10-25): the limiter above is
+# one global counter applied before tenant authentication -- "one caller
+# can consume the entire cap and reject other tenants." This is the
+# separate per-tenant admission control; wired as a route dependency
+# (`enforce_tenant_concurrency_limit` below), not a middleware, since it
+# has no tenant identity to key on until a route's own auth dependency
+# resolves one.
+app.state.tenant_concurrency_limiter = PerTenantConcurrencyLimiter(
+    get_settings().max_concurrent_requests_per_tenant
+)
+# R5: set once at import, like the limiters above -- a plain `app.state`
+# value, not read fresh from `get_settings()` per request, so tests can
+# swap it the same way `TestBackpressure` already swaps
+# `app.state.concurrency_limiter`.
+app.state.request_deadline_seconds = get_settings().request_deadline_seconds
 
 _EXEMPT_FROM_CONCURRENCY_LIMIT = frozenset({"/health/live", "/health/ready", "/metrics"})
 
@@ -107,6 +123,53 @@ async def _enforce_concurrency_limit(
         return await call_next(request)
     finally:
         await limiter.exit()
+
+
+@app.middleware("http")
+async def _enforce_request_deadline(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """R5: "neither [command_timeout nor pool_timeout] establishes an
+    overall HTTP request deadline." Bounds total wall-clock handling time
+    for one request regardless of how many individual calls (database or
+    otherwise) it makes -- a route making several calls each individually
+    within `command_timeout` could otherwise still run unboundedly long in
+    aggregate. Exempt the same always-fast, always-available routes the
+    concurrency limit exempts."""
+    if request.url.path in _EXEMPT_FROM_CONCURRENCY_LIMIT:
+        return await call_next(request)
+    deadline: float = request.app.state.request_deadline_seconds
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=deadline)
+    except TimeoutError:
+        error = IngressError(
+            IngressErrorCode.DEPENDENCY_UNAVAILABLE,
+            "request exceeded its deadline; retry shortly",
+        )
+        INGRESS_EVENTS_TOTAL.labels(outcome=error.code.value).inc()
+        return JSONResponse(status_code=error.status_code, content=error.to_body())
+
+
+async def enforce_tenant_concurrency_limit(
+    request: Request, tenant: Annotated[TenantContext, Depends(authenticate_tenant)]
+) -> AsyncIterator[None]:
+    """R5: the per-tenant counterpart to `_enforce_concurrency_limit`'s
+    global cap -- a `Depends`, not a middleware, since it needs the
+    `TenantContext` the route's own auth dependency resolves (FastAPI
+    caches `Depends(authenticate_tenant)` per request, so this does not
+    re-run authentication a second time)."""
+    limiter: PerTenantConcurrencyLimiter = request.app.state.tenant_concurrency_limiter
+    if not await limiter.try_enter(tenant.tenant_id):
+        # `handle_ingress_error` below already counts every IngressError
+        # exactly once by its own code -- no separate counter here.
+        raise IngressError(
+            IngressErrorCode.RATE_LIMITED,
+            "too many concurrent requests for this tenant; retry shortly",
+        )
+    try:
+        yield
+    finally:
+        await limiter.exit(tenant.tenant_id)
 
 
 def get_telemetry_store(request: Request) -> TelemetryStore:
@@ -272,6 +335,7 @@ spans may be rejected (every rejected span still counts toward
 async def receive_otlp_traces(
     request: Request,
     tenant: Annotated[TenantContext, Depends(authenticate_tenant)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
 ) -> Response:
