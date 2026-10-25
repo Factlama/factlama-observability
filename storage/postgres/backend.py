@@ -77,6 +77,17 @@ from storage.spans import SpanRecordOutcome
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_MAPPING_VERSIONS = frozenset({"factlama-genai-1"})
+"""R4 (review-evidence/g6-coverage-review-2026-10-25): the set of mapping
+versions this process can still normalize a replay under -- a deliberate
+literal duplicate of `collector/processing/otlp_attribute_mapping.py::
+MAPPING_VERSION`, not an import of it: `storage` must not depend on
+`collector` (`pyproject.toml`'s import-linter contract), the same reason
+`tests/conformance/conftest.py::make_span` already hardcodes this exact
+string rather than importing the constant. Extend this set the day a
+second mapping algorithm is actually introduced; until then there is
+only ever one to recognize."""
+
 DEFAULT_RECONCILIATION_WINDOW = timedelta(hours=24)
 """ADR-021: "Default 24 hours, configurable within (0, 72 hours]." """
 MAX_RECONCILIATION_WINDOW = timedelta(hours=72)
@@ -814,7 +825,11 @@ class PostgresTelemetryStore(TelemetryStore):
                 else:
                     existing = (
                         await conn.execute(
-                            select(spans.c.content_hash).where(
+                            select(
+                                spans.c.content_hash,
+                                spans.c.mapping_version,
+                                spans.c.semconv_version,
+                            ).where(
                                 spans.c.tenant_id == span.tenant_id,
                                 spans.c.trace_id == span.trace_id,
                                 spans.c.span_id == span.span_id,
@@ -826,11 +841,50 @@ class PostgresTelemetryStore(TelemetryStore):
                     # no-op success; a different hash under the same
                     # identity is CONFLICT, rejected without modifying
                     # the stored span.
-                    outcome = (
-                        SpanRecordOutcome.DUPLICATE
-                        if existing is not None and existing.content_hash == content_hash
-                        else SpanRecordOutcome.CONFLICT
-                    )
+                    if existing is not None and existing.content_hash == content_hash:
+                        outcome = SpanRecordOutcome.DUPLICATE
+                    elif existing is None:
+                        outcome = SpanRecordOutcome.CONFLICT  # pragma: no cover
+                    elif existing.mapping_version not in _SUPPORTED_MAPPING_VERSIONS:
+                        # R4 (review-evidence/g6-coverage-review-2026-10-25),
+                        # ADR-021 paragraph 65: "If [the stored mapping
+                        # profile] is unavailable, reject explicitly rather
+                        # than silently overwrite or compare incompatible
+                        # normalizations." A mapping version this process
+                        # no longer recognizes at all cannot be replayed
+                        # under -- comparing anyway (either direction) would
+                        # be exactly the silent, incompatible comparison
+                        # ADR-021 forbids.
+                        outcome = SpanRecordOutcome.CONFLICT
+                    else:
+                        # R4: a mapping-version/semconv-version bump between
+                        # the original ingest and this replay must not, on
+                        # its own, make an otherwise byte-identical replay
+                        # look like a content conflict -- "replays of
+                        # existing identities must be normalized using the
+                        # stored mapping profile." The ingress route
+                        # (collector/ingress/otlp.py::parse_span) always
+                        # normalizes with whatever mapping is currently
+                        # active; this re-attributes the incoming span to
+                        # the *stored* identity's own mapping/semconv
+                        # version before re-hashing, the only operation
+                        # "using the stored profile" can mean while a
+                        # single mapping algorithm (map_span_attributes)
+                        # has ever existed in this codebase -- a stored
+                        # version this process still recognizes (checked
+                        # above) has, by construction, never had a
+                        # different transformation registered for it.
+                        reattributed_hash = span.model_copy(
+                            update={
+                                "mapping_version": existing.mapping_version,
+                                "semconv_version": existing.semconv_version,
+                            }
+                        ).canonical_content_hash()
+                        outcome = (
+                            SpanRecordOutcome.DUPLICATE
+                            if reattributed_hash == existing.content_hash
+                            else SpanRecordOutcome.CONFLICT
+                        )
                 if outcome != SpanRecordOutcome.CONFLICT:
                     if span.evaluation_id is not None:
                         await self._touch_evaluation_link(
