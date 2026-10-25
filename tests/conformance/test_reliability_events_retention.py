@@ -14,6 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from schemas.tenancy import TenantContext
+from storage.errors import StorageUnavailableError
 from storage.postgres.backend import PostgresTelemetryStore
 from storage.postgres.tables import evaluation_links, reliability_events, retired_evaluations
 from tests.conformance.conftest import make_event, make_span
@@ -475,3 +476,126 @@ async def test_retirement_cannot_be_raced_by_a_concurrent_new_arrival(
     trace = await store.get_trace(TENANT_A, span.trace_id)
     assert trace is not None
     assert trace.evaluation_state.value != "AVAILABLE"
+
+
+async def test_a_retired_identity_does_not_block_a_different_tenants_identical_evaluation_id(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """ADR-021 Amendment A's acceptance list names tenant isolation for
+    the retirement path explicitly. `retired_evaluations`' primary key is
+    `(tenant_id, evaluation_id)` -- two tenants coincidentally choosing
+    the identical `evaluation_id` string must not interfere: retiring one
+    tenant's identity must never block the other tenant's unrelated use
+    of that same string."""
+    span_a = make_span(evaluation_id="eval-shared", trace_id="0123456789abcdef0123456789abcdef")
+    event_a = make_event(
+        evaluation_id="eval-shared", trace_id=span_a.trace_id, span_id=span_a.span_id
+    )
+    await store.record_reliability_event(event_a)
+
+    old = datetime.now(timezone.utc) - timedelta(days=6)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(evaluation_links)
+            .where(
+                evaluation_links.c.tenant_id == "tenant-a",
+                evaluation_links.c.evaluation_id == "eval-shared",
+            )
+            .values(
+                state="RECONCILIATION_EXPIRED",
+                first_received_at=old,
+                expires_at=old + timedelta(hours=24),
+            )
+        )
+        await conn.execute(
+            update(reliability_events)
+            .where(
+                reliability_events.c.tenant_id == "tenant-a",
+                reliability_events.c.evaluation_id == "eval-shared",
+            )
+            .values(received_at=old)
+        )
+    await store.delete_reliability_events(
+        "tenant-a", before=datetime.now(timezone.utc) + timedelta(seconds=1)
+    )
+    async with engine.connect() as conn:
+        assert (
+            await conn.execute(
+                select(retired_evaluations).where(
+                    retired_evaluations.c.tenant_id == "tenant-a",
+                    retired_evaluations.c.evaluation_id == "eval-shared",
+                )
+            )
+        ).first() is not None
+    assert not await _link_exists(engine, "tenant-a", "eval-shared")
+
+    span_b = make_span(
+        evaluation_id="eval-shared",
+        trace_id="fedcba9876543210fedcba9876543210",
+        tenant_id="tenant-b",
+    )
+    event_b = make_event(
+        evaluation_id="eval-shared",
+        trace_id=span_b.trace_id,
+        span_id=span_b.span_id,
+        tenant_id="tenant-b",
+    )
+    await store.record_reliability_event(event_b)
+    await store.record_normalized_span(span_b)
+
+    trace_b = await store.get_trace(TENANT_B, span_b.trace_id)
+    assert trace_b is not None
+    assert trace_b.evaluation_state.value == "AVAILABLE"
+
+
+async def test_a_rolled_back_retention_transaction_does_not_leave_a_tombstone(
+    store: PostgresTelemetryStore, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-021 Amendment A's acceptance list also names transaction
+    rollback preserving retirement protection. The tombstone INSERT and
+    the marker DELETE happen in one transaction in
+    `delete_reliability_events`, with the marker delete last -- if a
+    later statement in that same transaction fails, the whole thing,
+    including the tombstone write, must roll back together. A tombstone
+    silently surviving a rolled-back retirement attempt (while its
+    source marker did not) would misrepresent an identity as retired
+    that this call never actually finished retiring."""
+    event = make_event(evaluation_id="eval-1")
+    await store.record_reliability_event(event)
+
+    old = datetime.now(timezone.utc) - timedelta(days=6)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(evaluation_links).values(
+                state="RECONCILIATION_EXPIRED",
+                first_received_at=old,
+                expires_at=old + timedelta(hours=24),
+            )
+        )
+        await conn.execute(update(reliability_events).values(received_at=old))
+
+    original_execute = AsyncConnection.execute
+
+    async def failing_execute(
+        self: AsyncConnection, statement: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        if str(statement).startswith("DELETE FROM evaluation_links"):
+            raise OSError("simulated storage failure after the tombstone write")
+        return await original_execute(self, statement, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(AsyncConnection, "execute", failing_execute)
+    with pytest.raises(StorageUnavailableError):
+        await store.delete_reliability_events(
+            "tenant-a", before=datetime.now(timezone.utc) + timedelta(seconds=1)
+        )
+
+    async with engine.connect() as conn:
+        assert (
+            await conn.execute(
+                select(retired_evaluations).where(
+                    retired_evaluations.c.tenant_id == "tenant-a",
+                    retired_evaluations.c.evaluation_id == "eval-1",
+                )
+            )
+        ).first() is None
+    assert await _link_exists(engine, "tenant-a", "eval-1")
