@@ -18,7 +18,31 @@ class StorageConfigurationError(Exception):
     than deferring to the first query."""
 
 
-def create_storage_engine(database_url: str, *, pool_size: int = 10) -> AsyncEngine:
+DEFAULT_COMMAND_TIMEOUT = 10.0
+"""G6_FINAL_REVIEW_2026-10-24.md: "Engine construction supplies no explicit
+command timeout" -- a hung/partitioned database otherwise blocks a query
+indefinitely instead of failing the way the existing `StorageUnavailableError`
+translation already expects. asyncpg's `command_timeout` bounds every
+individual query on a connection client-side (`asyncio.TimeoutError`, which
+is `OSError` as of Python 3.11 -- already one of the exception types
+`storage/postgres/backend.py` catches and translates, so no change was
+needed there)."""
+
+DEFAULT_POOL_TIMEOUT = 30.0
+"""SQLAlchemy's own default, made explicit rather than left implicit --
+bounds how long a caller waits for a free connection from the pool itself
+(distinct from `command_timeout`, which bounds one query on an
+already-acquired connection). Raises `sqlalchemy.exc.TimeoutError`, a
+`SQLAlchemyError` subclass already caught by the same translation path."""
+
+
+def create_storage_engine(
+    database_url: str,
+    *,
+    pool_size: int = 10,
+    pool_timeout: float = DEFAULT_POOL_TIMEOUT,
+    command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
+) -> AsyncEngine:
     """Build one process-wide async engine. Does not connect yet --
     `check_ready` (below) performs the actual liveness check a
     startup/readiness hook should call before serving traffic."""
@@ -27,7 +51,13 @@ def create_storage_engine(database_url: str, *, pool_size: int = 10) -> AsyncEng
             "FACTLAMA_DATABASE_URL must use the postgresql+asyncpg:// driver; "
             f"got a URL starting with {database_url.split('://', 1)[0]!r}"
         )
-    return create_async_engine(database_url, pool_size=pool_size, pool_pre_ping=True)
+    return create_async_engine(
+        database_url,
+        pool_size=pool_size,
+        pool_pre_ping=True,
+        pool_timeout=pool_timeout,
+        connect_args={"command_timeout": command_timeout},
+    )
 
 
 async def check_ready(engine: AsyncEngine) -> None:

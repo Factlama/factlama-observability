@@ -28,6 +28,13 @@ DEFAULT_MAX_CONCURRENT_REQUESTS = 20
 DEFAULT_OTLP_MAX_BODY_BYTES = 4 * 1024 * 1024
 DEFAULT_OTLP_MAX_SPANS_PER_BATCH = 1_000
 
+# G6_FINAL_REVIEW_2026-10-24.md's "explicit query/ingress timeout bounds"
+# gap -- mirrors `storage/postgres/engine.py`'s own defaults, kept as
+# separate constants here so each service's env var documents its own
+# default independently of the storage module's.
+DEFAULT_DB_COMMAND_TIMEOUT = 10.0
+DEFAULT_DB_POOL_TIMEOUT = 30.0
+
 
 class Settings:
     """Process-wide ingress settings, read once from the environment."""
@@ -60,6 +67,14 @@ class Settings:
         # startup/readiness explicitly") -- Settings itself stays usable
         # without a database for anything that does not need one.
         self.database_url = os.environ.get("FACTLAMA_DATABASE_URL")
+        # G6_FINAL_REVIEW_2026-10-24.md: explicit query/ingress timeout
+        # bounds -- see `storage/postgres/engine.py`'s own constants/docstring.
+        self.db_command_timeout_seconds = float(
+            optional_env("FACTLAMA_DB_COMMAND_TIMEOUT_SECONDS", str(DEFAULT_DB_COMMAND_TIMEOUT))
+        )
+        self.db_pool_timeout_seconds = float(
+            optional_env("FACTLAMA_DB_POOL_TIMEOUT_SECONDS", str(DEFAULT_DB_POOL_TIMEOUT))
+        )
 
 
 @lru_cache

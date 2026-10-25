@@ -35,7 +35,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "FACTLAMA_DATABASE_URL must be set to start the ingress (OBS-06: PostgreSQL "
             "is a required dependency of the whole service)"
         )
-    engine = create_storage_engine(settings.database_url)
+    engine = create_storage_engine(
+        settings.database_url,
+        command_timeout=settings.db_command_timeout_seconds,
+        pool_timeout=settings.db_pool_timeout_seconds,
+    )
     # Fail startup explicitly rather than accepting traffic against a
     # database that was never reachable in the first place.
     await check_ready(engine)

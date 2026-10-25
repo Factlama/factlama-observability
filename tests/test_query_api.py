@@ -17,6 +17,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from operations.concurrency import ConcurrencyLimiter
 from operations.tenant_credentials import TenantCredentialStore
 from query.api.app import app, get_storage_readiness, get_telemetry_store
 from query.api.settings import Settings, get_settings
@@ -577,6 +578,45 @@ class TestEvaluationAggregates:
         assert response.status_code == 200
         assert "metrics" in response.json()
         assert "evaluation_id" not in response.json()
+
+
+class TestBackpressure:
+    """G6_FINAL_REVIEW_2026-10-24.md's "per-tenant overload" gap: the query
+    service had no concurrency cap at all, unlike the collector's ingress
+    (`tests/test_collector_ingress.py::TestBackpressure`, mirrored here)."""
+
+    def _saturate(self) -> ConcurrencyLimiter:
+        original = app.state.concurrency_limiter
+        app.state.concurrency_limiter = ConcurrencyLimiter(max_concurrent=1)
+        entered = asyncio.run(app.state.concurrency_limiter.try_enter())
+        assert entered is True
+        return original
+
+    def test_rejects_once_the_limit_is_reached(self, client: TestClient) -> None:
+        original = self._saturate()
+        try:
+            response = _get(client, "no-such-eval", token=TENANT_ONE_KEY)
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        finally:
+            app.state.concurrency_limiter = original
+
+    def test_health_and_metrics_are_exempt_from_the_limit(self, client: TestClient) -> None:
+        original = self._saturate()
+        try:
+            assert client.get("/health/live").status_code == 200
+            assert client.get("/metrics").status_code == 200
+        finally:
+            app.state.concurrency_limiter = original
+
+    def test_exit_frees_the_slot_for_the_next_request(self, client: TestClient) -> None:
+        original = self._saturate()
+        try:
+            asyncio.run(app.state.concurrency_limiter.exit())
+            response = _get(client, "no-such-eval", token=TENANT_ONE_KEY)
+            assert response.status_code == 404
+        finally:
+            app.state.concurrency_limiter = original
 
 
 class TestMetrics:

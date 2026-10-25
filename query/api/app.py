@@ -15,12 +15,14 @@ internal ingestion path.
 """
 
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
 
+from operations.concurrency import ConcurrencyLimiter
 from operations.metrics import install_metrics
 from query.api.bootstrap import check_storage_ready, lifespan
 from query.api.cursor import CursorError, decode_cursor, encode_cursor
@@ -34,6 +36,35 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FactLama Observability Query API", version="0.1", lifespan=lifespan)
 install_metrics(app, build_version="0.1")
+
+# G6_FINAL_REVIEW_2026-10-24.md's "per-tenant overload" gap: the collector's
+# ingress already bounds concurrency this way (`collector/ingress/app.py`);
+# the query service had no equivalent cap at all. Same plain in-flight
+# counter, same fail-fast-never-queue rationale (`operations/concurrency.py`).
+app.state.concurrency_limiter = ConcurrencyLimiter(get_settings().max_concurrent_requests)
+
+_EXEMPT_FROM_CONCURRENCY_LIMIT = frozenset({"/health/live", "/health/ready", "/metrics"})
+
+
+@app.middleware("http")
+async def _enforce_concurrency_limit(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Rejects with a typed 503 the instant the in-flight cap is reached --
+    mirrors `collector/ingress/app.py`'s own middleware exactly."""
+    if request.url.path in _EXEMPT_FROM_CONCURRENCY_LIMIT:
+        return await call_next(request)
+    limiter: ConcurrencyLimiter = request.app.state.concurrency_limiter
+    if not await limiter.try_enter():
+        error = QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "too many concurrent requests; retry shortly"
+        )
+        return JSONResponse(status_code=error.status_code, content=error.to_body())
+    try:
+        return await call_next(request)
+    finally:
+        await limiter.exit()
+
 
 # OBS-07 stage-3 (2026-10-23): bounded page size and bounded time window --
 # "bounded time filters and stable ... pagination" is this slice's own

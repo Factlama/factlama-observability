@@ -7,7 +7,18 @@ import os
 import secrets
 from functools import lru_cache
 
+from operations.config import optional_env
 from operations.tenant_credentials import TenantCredentialStore
+
+# G6_FINAL_REVIEW_2026-10-24.md's "explicit query/ingress timeout bounds"
+# gap -- mirrors `storage/postgres/engine.py`'s own defaults.
+DEFAULT_DB_COMMAND_TIMEOUT = 10.0
+DEFAULT_DB_POOL_TIMEOUT = 30.0
+
+# Same gap, "per-tenant overload" half: `collector/ingress/app.py` already
+# bounds concurrency this way; the query service had no equivalent at all.
+# Same default as collector/ingress/settings.py's DEFAULT_MAX_CONCURRENT_REQUESTS.
+DEFAULT_MAX_CONCURRENT_REQUESTS = 20
 
 
 class Settings:
@@ -22,6 +33,15 @@ class Settings:
         # startup/readiness explicitly") -- Settings itself stays usable
         # without a database for anything that does not need one.
         self.database_url = os.environ.get("FACTLAMA_DATABASE_URL")
+        self.db_command_timeout_seconds = float(
+            optional_env("FACTLAMA_DB_COMMAND_TIMEOUT_SECONDS", str(DEFAULT_DB_COMMAND_TIMEOUT))
+        )
+        self.db_pool_timeout_seconds = float(
+            optional_env("FACTLAMA_DB_POOL_TIMEOUT_SECONDS", str(DEFAULT_DB_POOL_TIMEOUT))
+        )
+        self.max_concurrent_requests = int(
+            optional_env("FACTLAMA_MAX_CONCURRENT_REQUESTS", str(DEFAULT_MAX_CONCURRENT_REQUESTS))
+        )
         # ADR-021: "Cursors bind authenticated tenant/project/application
         # scope, resolved window, filters, sort order, query version and
         # finite expiry, with integrity protection." This HMAC-signs that
