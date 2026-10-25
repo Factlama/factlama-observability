@@ -10,11 +10,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from schemas.tenancy import TenantContext
 from storage.postgres.backend import PostgresTelemetryStore, _span_to_row
-from storage.postgres.tables import spans
+from storage.postgres.tables import evaluation_links, spans
 from storage.spans import SpanRecordOutcome
 from tests.conformance.conftest import make_event, make_span
 
@@ -424,3 +425,176 @@ async def test_a_stale_concurrent_read_cannot_revive_an_expired_link(
     final = await short_window_store.get_trace(TENANT_A, span.trace_id)
     assert final is not None
     assert final.evaluation_state.value == "RECONCILIATION_EXPIRED"
+
+
+async def test_a_single_paused_reader_cannot_link_past_the_deadline(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2 (review-evidence/g6-cas-review-2026-10-25): the read-race fix
+    above closes the race between *two* readers, but a single reader
+    pausing across the deadline with no competing writer at all is a
+    separate case -- `get_trace` captured `now` once at method entry,
+    so if it resumes after the deadline with nothing else having
+    touched the row, its own stale snapshot still said "not yet
+    expired" and the guarded update's old `state == row.state`
+    precondition alone did not catch this. The write must recheck the
+    deadline using PostgreSQL's own live clock, not a Python timestamp
+    captured before the pause."""
+    store = PostgresTelemetryStore(engine, reconciliation_window=timedelta(seconds=1))
+    span = make_span(project_id="proj-a", application_id="app-a")
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id=span.trace_id,
+        span_id=span.span_id,
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    await store.record_reliability_event(event)
+    async with engine.begin() as conn:
+        await conn.execute(
+            spans.insert().values(
+                **_span_to_row(span, span.canonical_content_hash(), datetime.now(timezone.utc))
+            )
+        )
+
+    selected = asyncio.Event()
+    resume = asyncio.Event()
+    original_execute_3 = AsyncConnection.execute
+
+    async def synchronized_execute_3(
+        self: AsyncConnection, statement: object, *args: Any, **kwargs: Any
+    ) -> Any:
+        sql = str(statement)
+        current_task = asyncio.current_task()
+        if (
+            current_task is not None
+            and current_task.get_name() == "paused-reader"
+            and sql.startswith("SELECT")
+            and "FROM evaluation_links" in sql
+        ):
+            selected.set()
+            await asyncio.wait_for(resume.wait(), 5)
+        return await original_execute_3(self, statement, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(AsyncConnection, "execute", synchronized_execute_3)
+    paused_reader = asyncio.create_task(
+        store.get_trace(TENANT_A, span.trace_id), name="paused-reader"
+    )
+    try:
+        await asyncio.wait_for(selected.wait(), 5)
+        await asyncio.sleep(1.1)  # cross the 1-second deadline with no second reader at all
+    finally:
+        resume.set()
+    trace = await paused_reader
+
+    assert trace is not None
+    assert trace.evaluation_state.value == "RECONCILIATION_EXPIRED"
+
+
+async def test_a_transition_delayed_across_expiry_by_a_database_lock(
+    engine: AsyncEngine,
+) -> None:
+    """The guarded update's deadline check must hold even when the
+    update statement itself has to wait behind another transaction's
+    row lock -- `clock_timestamp()` is re-evaluated at the moment the
+    lock is actually acquired, not when the statement was issued, so a
+    transition delayed by a lock wait is still checked against real
+    time, never the time it was queued."""
+    store = PostgresTelemetryStore(engine, reconciliation_window=timedelta(seconds=1))
+    span = make_span(project_id="proj-a", application_id="app-a")
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id=span.trace_id,
+        span_id=span.span_id,
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    await store.record_reliability_event(event)
+    async with engine.begin() as conn:
+        await conn.execute(
+            spans.insert().values(
+                **_span_to_row(span, span.canonical_content_hash(), datetime.now(timezone.utc))
+            )
+        )
+
+    async with engine.connect() as lock_conn, lock_conn.begin():
+        await lock_conn.execute(
+            select(evaluation_links)
+            .where(
+                evaluation_links.c.tenant_id == "tenant-a",
+                evaluation_links.c.evaluation_id == "eval-1",
+            )
+            .with_for_update()
+        )
+        reader = asyncio.create_task(store.get_trace(TENANT_A, span.trace_id))
+        await asyncio.sleep(0.2)  # let the reader's own UPDATE reach and block on our lock
+        await asyncio.sleep(1.1)  # cross the 1-second deadline while still holding the lock
+        # Exiting `lock_conn.begin()` commits and releases the lock here.
+
+    trace = await reader
+    assert trace is not None
+    assert trace.evaluation_state.value == "RECONCILIATION_EXPIRED"
+
+
+async def test_get_trace_reconciliation_still_links_successfully_before_expiry(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """The guarded transition's happy path: a span inserted directly
+    (the same fixture-isolation technique the deadline reproductions
+    use) within the deadline must still link normally -- the new
+    deadline check must not make a legitimate, timely transition fail."""
+    span = make_span(project_id="proj-a", application_id="app-a")
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id=span.trace_id,
+        span_id=span.span_id,
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    await store.record_reliability_event(event)
+    async with engine.begin() as conn:
+        await conn.execute(
+            spans.insert().values(
+                **_span_to_row(span, span.canonical_content_hash(), datetime.now(timezone.utc))
+            )
+        )
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"
+
+
+async def test_an_already_available_link_stays_available_past_its_original_deadline(
+    engine: AsyncEngine,
+) -> None:
+    """Acceptance (review-evidence/g6-cas-review-2026-10-25): AVAILABLE
+    is terminal -- a link that completed before its deadline must stay
+    AVAILABLE forever after, including long after that original
+    deadline has passed, never re-evaluated or touched again."""
+    short_window_store = PostgresTelemetryStore(engine, reconciliation_window=timedelta(seconds=1))
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id="0123456789abcdef0123456789abcdef",
+        span_id="0123456789abcdef",
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    await short_window_store.record_reliability_event(event)
+    span = make_span(
+        evaluation_id="eval-1",
+        trace_id="0123456789abcdef0123456789abcdef",
+        span_id="0123456789abcdef",
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    await short_window_store.record_normalized_span(span)
+
+    trace = await short_window_store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"
+
+    await asyncio.sleep(1.1)  # well past the 1-second deadline
+
+    trace = await short_window_store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"

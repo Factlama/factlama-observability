@@ -738,7 +738,6 @@ class PostgresTelemetryStore(TelemetryStore):
         return outcome
 
     async def get_trace(self, tenant: TenantContext, trace_id: str) -> AITrace | None:
-        now = datetime.now(timezone.utc)
         try:
             async with self._engine.begin() as conn:
                 span_rows = (
@@ -764,77 +763,105 @@ class PostgresTelemetryStore(TelemetryStore):
 
                 links: list[EvaluationLinkRow] = []
                 for row in link_rows:
-                    link = apply_lazy_expiry(_row_to_link(row), now=now)
-                    # F3 (review-evidence/g6-fix-followup-2026-10-24): a
-                    # concurrent write-time lookup can miss its
-                    # counterpart under ordinary read-committed isolation
-                    # -- each transaction only sees what was already
-                    # committed when its own lookup ran, so two truly
-                    # concurrent inserts can each finish seeing nothing
-                    # to match, with nothing left to retry it afterwards.
-                    # The next read is this lazy design's own recovery
-                    # point, the same way lazy expiry already is. Only
-                    # ever looks for a missing *span*-side confirmation --
-                    # an event's own touch always marks its own side
-                    # directly within its own transaction, with no
-                    # equivalent visibility race on that side.
-                    if link.state == PENDING and not link.span_received:
-                        matched_span = select_unique_matching_span(
+                    if row.state != PENDING:
+                        # AVAILABLE and RECONCILIATION_EXPIRED are both
+                        # terminal -- nothing below can ever change them,
+                        # so there is nothing to reconcile or guard here.
+                        links.append(_row_to_link(row))
+                        continue
+
+                    # P2 (review-evidence/g6-cas-review-2026-10-25): a
+                    # volatile SQL function (clock_timestamp()) embedded
+                    # in a conditional UPDATE's own WHERE clause is not
+                    # reliably re-evaluated after that statement has to
+                    # wait behind another transaction's row lock --
+                    # PostgreSQL's EvalPlanQual re-check only triggers
+                    # when the lock holder actually wrote a new tuple
+                    # version; a holder that only read (e.g. a touch
+                    # whose conflict ended in a no-op) releases without
+                    # producing one, so the blocked statement can still
+                    # apply its pre-wait qual result. Locking this row
+                    # explicitly first, then capturing wall-clock time
+                    # only once that lock is actually held, removes any
+                    # dependency on that engine-internal behavior --
+                    # F3's own lazy reconciliation is this lazy design's
+                    # recovery point for a concurrent write-time miss
+                    # (review-evidence/g6-fix-followup-2026-10-24); this
+                    # lock only ever runs for a link still PENDING here,
+                    # never for every trace read.
+                    locked_row = (
+                        await conn.execute(
+                            select(evaluation_links)
+                            .where(
+                                evaluation_links.c.tenant_id == tenant.tenant_id,
+                                evaluation_links.c.evaluation_id == row.evaluation_id,
+                            )
+                            .with_for_update()
+                        )
+                    ).first()
+                    if locked_row is None:
+                        links.append(_row_to_link(row))
+                        continue
+                    if locked_row.state != PENDING:
+                        # Finalized by whichever transaction held this
+                        # lock before us -- trust it completely.
+                        links.append(_row_to_link(locked_row))
+                        continue
+
+                    link = _row_to_link(locked_row)
+                    now = datetime.now(timezone.utc)
+                    if link.expires_at is not None and now >= link.expires_at:
+                        await conn.execute(
+                            update(evaluation_links)
+                            .where(
+                                evaluation_links.c.tenant_id == tenant.tenant_id,
+                                evaluation_links.c.evaluation_id == link.evaluation_id,
+                            )
+                            .values(state=RECONCILIATION_EXPIRED)
+                        )
+                        links.append(replace(link, state=RECONCILIATION_EXPIRED))
+                        continue
+
+                    matched_span = (
+                        None
+                        if link.span_received
+                        else select_unique_matching_span(
                             link_project_id=link.project_id,
                             link_application_id=link.application_id,
                             required_span_id=link.span_id,
                             candidates=span_candidates,
                         )
-                        if matched_span is not None:
-                            link = replace(
-                                link,
-                                span_id=link.span_id or matched_span.span_id,
-                                span_received=True,
-                                state=AVAILABLE if link.event_received else link.state,
-                            )
-                    if (
-                        link.state != row.state
-                        or link.span_received != row.span_received
-                        or link.span_id != row.span_id
-                    ):
-                        # P1 (review-evidence/g6-read-review-2026-10-25):
-                        # this update must never blindly apply a result
-                        # computed from a stale snapshot -- a concurrent
-                        # reader could have already expired (or otherwise
-                        # changed) this same row after we read it but
-                        # before we write. The `state == row.state`
-                        # precondition makes the write conditional on
-                        # nothing having changed since our own read; if
-                        # another writer got there first, this affects
-                        # zero rows, and we reload the now-committed row
-                        # and trust it completely instead of our own
-                        # stale computation -- never retried, never
-                        # merged with it.
-                        result = await conn.execute(
-                            update(evaluation_links)
-                            .where(
-                                evaluation_links.c.tenant_id == tenant.tenant_id,
-                                evaluation_links.c.evaluation_id == link.evaluation_id,
-                                evaluation_links.c.state == row.state,
-                            )
-                            .values(
-                                state=link.state,
-                                span_received=link.span_received,
-                                span_id=link.span_id,
-                            )
+                    )
+                    if matched_span is None:
+                        links.append(link)
+                        continue
+
+                    # Safe to apply unconditionally: this transaction
+                    # holds the exclusive lock on this row for the rest
+                    # of its own duration, so nothing else can race this
+                    # write. `matched_span is not None` only when
+                    # `span_received` was False, which only ever happens
+                    # when this link was created by an event touch --
+                    # `event_received` is therefore already true here.
+                    updated = replace(
+                        link,
+                        span_id=link.span_id or matched_span.span_id,
+                        span_received=True,
+                        state=AVAILABLE,
+                    )
+                    await conn.execute(
+                        update(evaluation_links)
+                        .where(
+                            evaluation_links.c.tenant_id == tenant.tenant_id,
+                            evaluation_links.c.evaluation_id == link.evaluation_id,
                         )
-                        if result.rowcount == 0:
-                            fresh_row = (
-                                await conn.execute(
-                                    select(evaluation_links).where(
-                                        evaluation_links.c.tenant_id == tenant.tenant_id,
-                                        evaluation_links.c.evaluation_id == link.evaluation_id,
-                                    )
-                                )
-                            ).first()
-                            if fresh_row is not None:
-                                link = _row_to_link(fresh_row)
-                    links.append(link)
+                        .values(
+                            state=updated.state,
+                            span_received=updated.span_received,
+                            span_id=updated.span_id,
+                        )
+                    )
+                    links.append(updated)
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(f"could not read trace {trace_id!r}: {exc}") from exc
 
