@@ -6,7 +6,7 @@ receiver, once blocked on a canonical `AITrace`/span schema that now
 exists in `contracts/v0.1`.
 """
 
-import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated, Any
@@ -29,6 +29,7 @@ from collector.ingress.otlp import (
 from collector.ingress.settings import Settings, get_settings
 from operations.concurrency import ConcurrencyLimiter, PerTenantConcurrencyLimiter
 from operations.metrics import install_metrics
+from operations.request_deadline import RequestDeadlineMiddleware
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
 from storage.backend import TelemetryStore
@@ -125,29 +126,27 @@ async def _enforce_concurrency_limit(
         await limiter.exit()
 
 
-@app.middleware("http")
-async def _enforce_request_deadline(
-    request: Request, call_next: Callable[[Request], Awaitable[Response]]
-) -> Response:
-    """R5: "neither [command_timeout nor pool_timeout] establishes an
-    overall HTTP request deadline." Bounds total wall-clock handling time
-    for one request regardless of how many individual calls (database or
-    otherwise) it makes -- a route making several calls each individually
-    within `command_timeout` could otherwise still run unboundedly long in
-    aggregate. Exempt the same always-fast, always-available routes the
-    concurrency limit exempts."""
-    if request.url.path in _EXEMPT_FROM_CONCURRENCY_LIMIT:
-        return await call_next(request)
-    deadline: float = request.app.state.request_deadline_seconds
-    try:
-        return await asyncio.wait_for(call_next(request), timeout=deadline)
-    except TimeoutError:
-        error = IngressError(
-            IngressErrorCode.DEPENDENCY_UNAVAILABLE,
-            "request exceeded its deadline; retry shortly",
-        )
-        INGRESS_EVENTS_TOTAL.labels(outcome=error.code.value).inc()
-        return JSONResponse(status_code=error.status_code, content=error.to_body())
+def _build_deadline_timeout_response() -> tuple[int, bytes]:
+    """F3 (review-evidence/g6-coverage-fix-review-2026-10-25): raw ASGI,
+    not `@app.middleware("http")` -- see `operations.request_deadline`'s
+    own docstring for why `BaseHTTPMiddleware` cannot actually cancel the
+    downstream handler. Counted manually, same as `_enforce_concurrency_limit`
+    above: a raw ASGI middleware's own response never passes through
+    `handle_ingress_error`, the one place every *route-raised* IngressError
+    is otherwise counted exactly once."""
+    error = IngressError(
+        IngressErrorCode.DEPENDENCY_UNAVAILABLE, "request exceeded its deadline; retry shortly"
+    )
+    INGRESS_EVENTS_TOTAL.labels(outcome=error.code.value).inc()
+    return error.status_code, json.dumps(error.to_body()).encode()
+
+
+app.add_middleware(
+    RequestDeadlineMiddleware,
+    state=app.state,
+    exempt_paths=_EXEMPT_FROM_CONCURRENCY_LIMIT,
+    build_timeout_response=_build_deadline_timeout_response,
+)
 
 
 async def enforce_tenant_concurrency_limit(

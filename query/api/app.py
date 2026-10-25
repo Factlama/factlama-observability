@@ -14,8 +14,8 @@ independent, tenant-facing reader of the same storage, not part of the
 internal ingestion path.
 """
 
-import asyncio
 import hmac
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from operations.concurrency import ConcurrencyLimiter, PerTenantConcurrencyLimiter
 from operations.metrics import install_metrics
+from operations.request_deadline import RequestDeadlineMiddleware
 from query.api.bootstrap import check_storage_ready, lifespan
 from query.api.cursor import CursorError, decode_cursor, encode_cursor
 from query.api.errors import QueryError, QueryErrorCode
@@ -79,23 +80,23 @@ async def _enforce_concurrency_limit(
         await limiter.exit()
 
 
-@app.middleware("http")
-async def _enforce_request_deadline(
-    request: Request, call_next: Callable[[Request], Awaitable[Response]]
-) -> Response:
-    """R5: "neither [command_timeout nor pool_timeout] establishes an
-    overall HTTP request deadline." Mirrors
-    `collector/ingress/app.py`'s own middleware exactly."""
-    if request.url.path in _EXEMPT_FROM_CONCURRENCY_LIMIT:
-        return await call_next(request)
-    deadline: float = request.app.state.request_deadline_seconds
-    try:
-        return await asyncio.wait_for(call_next(request), timeout=deadline)
-    except TimeoutError:
-        error = QueryError(
-            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "request exceeded its deadline; retry shortly"
-        )
-        return JSONResponse(status_code=error.status_code, content=error.to_body())
+def _build_deadline_timeout_response() -> tuple[int, bytes]:
+    """F3 (review-evidence/g6-coverage-fix-review-2026-10-25): raw ASGI,
+    not `@app.middleware("http")` -- see `operations.request_deadline`'s
+    own docstring for why `BaseHTTPMiddleware` cannot actually cancel the
+    downstream handler."""
+    error = QueryError(
+        QueryErrorCode.DEPENDENCY_UNAVAILABLE, "request exceeded its deadline; retry shortly"
+    )
+    return error.status_code, json.dumps(error.to_body()).encode()
+
+
+app.add_middleware(
+    RequestDeadlineMiddleware,
+    state=app.state,
+    exempt_paths=_EXEMPT_FROM_CONCURRENCY_LIMIT,
+    build_timeout_response=_build_deadline_timeout_response,
+)
 
 
 # OBS-07 stage-3 (2026-10-23): bounded page size and bounded time window --

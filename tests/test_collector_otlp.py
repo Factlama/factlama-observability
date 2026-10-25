@@ -7,6 +7,7 @@ correctness is proven against a live PostgreSQL by
 """
 
 import asyncio
+import time
 from collections.abc import Iterator
 
 import httpx
@@ -311,6 +312,53 @@ class TestPerTenantConcurrency:
             assert response.status_code == 200
         finally:
             app.state.tenant_concurrency_limiter = original
+
+
+class TestRequestDeadline:
+    """F3 (review-evidence/g6-coverage-fix-review-2026-10-25): the
+    previous `@app.middleware("http")`-based deadline (`BaseHTTPMiddleware`)
+    returned a prompt timeout response while the real handler kept
+    running to completion in a separate task `call_next`'s own
+    `asyncio.wait_for` never touched. A real async ASGI client is what
+    actually proves cancellation reaches the handler."""
+
+    async def test_the_deadline_actually_cancels_downstream_work(
+        self, store: FakeTelemetryStore
+    ) -> None:
+        completed = []
+        original_record = store.record_normalized_span
+
+        async def slow_record(span: NormalizedSpan) -> SpanRecordOutcome:
+            await asyncio.sleep(0.3)
+            completed.append(True)
+            return await original_record(span)
+
+        store.record_normalized_span = slow_record  # type: ignore[method-assign]
+        original_deadline = app.state.request_deadline_seconds
+        app.state.request_deadline_seconds = 0.03
+        app.dependency_overrides[get_telemetry_store] = lambda: store
+        app.dependency_overrides[get_storage_readiness] = lambda: True
+        app.dependency_overrides[get_settings] = lambda: _test_settings()
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as async_client:
+                start = time.monotonic()
+                response = await async_client.post(
+                    "/v1/traces",
+                    content=_build_request_body([_make_span()]),
+                    headers={
+                        "Authorization": f"Bearer {API_KEY}",
+                        "Content-Type": "application/x-protobuf",
+                    },
+                )
+                elapsed = time.monotonic() - start
+            assert response.status_code == 503
+            assert not completed, f"downstream completed after timeout; took {elapsed:.3f}s"
+            assert elapsed < 0.2  # well under the handler's own 0.3s sleep
+        finally:
+            app.state.request_deadline_seconds = original_deadline
+            app.dependency_overrides.clear()
 
 
 class TestMetrics:

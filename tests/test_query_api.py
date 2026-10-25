@@ -11,6 +11,7 @@ as the one OBS-07 needed to exist to close.
 """
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -19,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from operations.concurrency import ConcurrencyLimiter, PerTenantConcurrencyLimiter
 from operations.tenant_credentials import TenantCredentialStore
-from query.api.app import app, get_storage_readiness, get_telemetry_store
+from query.api.app import app, authenticate, get_storage_readiness, get_telemetry_store
 from query.api.settings import Settings, get_settings
 from schemas.aitrace import AITrace
 from schemas.reliability_event import ReliabilityEvent
@@ -792,6 +793,45 @@ class TestRequestDeadline:
             assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
         finally:
             app.state.request_deadline_seconds = original
+
+    async def test_the_deadline_actually_cancels_downstream_work(self) -> None:
+        """F3 (review-evidence/g6-coverage-fix-review-2026-10-25):
+        `TestClient`'s own synchronous wrapper does not surface whether
+        the *handler itself* was cancelled, only that a 503 came back --
+        the previous `@app.middleware("http")`-based deadline passed the
+        test above while still letting the real handler run to
+        completion in the background (`BaseHTTPMiddleware` runs it in a
+        separate task `call_next`'s own `asyncio.wait_for` never
+        touches). A real async ASGI client is what actually proves
+        cancellation reached the handler, matching the review's own
+        reproduction technique exactly."""
+        completed = []
+
+        class SlowStore:
+            async def get_trace(self, tenant: TenantContext, trace_id: str) -> None:
+                await asyncio.sleep(0.3)
+                completed.append(True)
+                return None
+
+        prior_overrides = dict(app.dependency_overrides)
+        app.dependency_overrides[authenticate] = lambda: TenantContext(tenant_id="deadline-tenant")
+        app.dependency_overrides[get_telemetry_store] = lambda: SlowStore()
+        original_deadline = app.state.request_deadline_seconds
+        app.state.request_deadline_seconds = 0.03
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as async_client:
+                start = time.monotonic()
+                response = await async_client.get(f"/v0.1/ai/traces/{'0' * 32}")
+                elapsed = time.monotonic() - start
+            assert response.status_code == 503
+            assert not completed, f"downstream completed after timeout; took {elapsed:.3f}s"
+            assert elapsed < 0.2  # well under the handler's own 0.3s sleep
+        finally:
+            app.state.request_deadline_seconds = original_deadline
+            app.dependency_overrides.clear()
+            app.dependency_overrides.update(prior_overrides)
 
 
 class TestMetrics:
