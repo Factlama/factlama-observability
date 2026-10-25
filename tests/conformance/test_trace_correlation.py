@@ -438,8 +438,8 @@ async def test_a_single_paused_reader_cannot_link_past_the_deadline(
     touched the row, its own stale snapshot still said "not yet
     expired" and the guarded update's old `state == row.state`
     precondition alone did not catch this. The write must recheck the
-    deadline using PostgreSQL's own live clock, not a Python timestamp
-    captured before the pause."""
+    deadline using a Python timestamp captured only after the lock
+    wait/pause, never one taken before it."""
     store = PostgresTelemetryStore(engine, reconciliation_window=timedelta(seconds=1))
     span = make_span(project_id="proj-a", application_id="app-a")
     event = make_event(
@@ -494,9 +494,9 @@ async def test_a_single_paused_reader_cannot_link_past_the_deadline(
 async def test_a_transition_delayed_across_expiry_by_a_database_lock(
     engine: AsyncEngine,
 ) -> None:
-    """The guarded update's deadline check must hold even when the
-    update statement itself has to wait behind another transaction's
-    row lock -- `clock_timestamp()` is re-evaluated at the moment the
+    """The deadline check must hold even when the reader's own
+    `SELECT ... FOR UPDATE` has to wait behind another transaction's
+    row lock -- wall-clock time is captured in Python only once that
     lock is actually acquired, not when the statement was issued, so a
     transition delayed by a lock wait is still checked against real
     time, never the time it was queued."""
@@ -527,7 +527,9 @@ async def test_a_transition_delayed_across_expiry_by_a_database_lock(
             .with_for_update()
         )
         reader = asyncio.create_task(store.get_trace(TENANT_A, span.trace_id))
-        await asyncio.sleep(0.2)  # let the reader's own UPDATE reach and block on our lock
+        await asyncio.sleep(
+            0.2
+        )  # let the reader's own SELECT ... FOR UPDATE reach and block on our lock
         await asyncio.sleep(1.1)  # cross the 1-second deadline while still holding the lock
         # Exiting `lock_conn.begin()` commits and releases the lock here.
 
