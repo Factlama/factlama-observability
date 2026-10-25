@@ -60,6 +60,7 @@ from storage.correlation import (
     RECONCILIATION_EXPIRED,
     EvaluationLinkConflict,
     EvaluationLinkRow,
+    InteractionSpanCandidate,
     LinkIdentity,
     SpanIdentity,
     apply_lazy_expiry,
@@ -67,6 +68,7 @@ from storage.correlation import (
     new_link,
     select_unique_matching_link,
     select_unique_matching_span,
+    select_unique_trace_for_interaction,
     touch_link,
 )
 from storage.errors import StorageUnavailableError
@@ -198,6 +200,7 @@ def _link_to_row(link: EvaluationLinkRow) -> dict[str, Any]:
         "application_id": link.application_id,
         "trace_id": link.trace_id,
         "span_id": link.span_id,
+        "interaction_id": link.interaction_id,
         "state": link.state,
         "first_received_at": link.first_received_at,
         "expires_at": link.expires_at,
@@ -214,6 +217,7 @@ def _row_to_link(row: Any) -> EvaluationLinkRow:
         application_id=row.application_id,
         trace_id=row.trace_id,
         span_id=row.span_id,
+        interaction_id=row.interaction_id,
         state=row.state,
         first_received_at=row.first_received_at,
         expires_at=row.expires_at,
@@ -296,9 +300,65 @@ class PostgresTelemetryStore(TelemetryStore):
                         application_id=event.application_id,
                         trace_id=event.trace_id,
                         span_id=event.span_id,
+                        interaction_id=event.interaction_id,
                         source="event",
                         now=received_at,
                     )
+
+                    # G6_FINAL_REVIEW_2026-10-24.md: "Interaction-only
+                    # unique/ambiguous matching ... [is] not established by
+                    # the current evaluation-ID-centric matching." An event
+                    # naming no trace/span but an interaction_id can still
+                    # resolve a trace -- ADR-021: "Interaction-only matches
+                    # remain pending when ambiguous; do not guess a trace" --
+                    # if exactly one distinct trace_id among this tenant's
+                    # spans sharing that interaction_id is compatible with
+                    # the link's own established scope. Only attempted while
+                    # the link's trace is still unknown: once resolved
+                    # (here or by any other touch), it is fixed forever, the
+                    # same rule already governing project/application scope.
+                    resolved_trace_id = event.trace_id
+                    if (
+                        resolved_trace_id is None
+                        and event.interaction_id is not None
+                        and link is not None
+                        and link.trace_id is None
+                    ):
+                        interaction_rows = (
+                            await conn.execute(
+                                select(
+                                    spans.c.trace_id, spans.c.project_id, spans.c.application_id
+                                ).where(
+                                    spans.c.tenant_id == event.tenant_id,
+                                    spans.c.interaction_id == event.interaction_id,
+                                )
+                            )
+                        ).all()
+                        resolved = select_unique_trace_for_interaction(
+                            link_project_id=link.project_id,
+                            link_application_id=link.application_id,
+                            candidates=[
+                                InteractionSpanCandidate(
+                                    row.trace_id, row.project_id, row.application_id
+                                )
+                                for row in interaction_rows
+                            ],
+                        )
+                        if resolved is not None:
+                            link = await self._touch_evaluation_link(
+                                conn,
+                                tenant_id=event.tenant_id,
+                                evaluation_id=event.evaluation_id,
+                                project_id=link.project_id,
+                                application_id=link.application_id,
+                                trace_id=resolved,
+                                span_id=None,
+                                interaction_id=event.interaction_id,
+                                source="event",
+                                now=received_at,
+                            )
+                            resolved_trace_id = resolved
+
                     # R3/F2 (review-evidence/g6-final-2026-10-24 and
                     # g6-fix-followup-2026-10-24): an event naming a
                     # trace -- an exact span_id if it has one, or ADR-021's
@@ -311,14 +371,14 @@ class PostgresTelemetryStore(TelemetryStore):
                     # link if a concurrent touch set it) -- a trace-level
                     # reference with more than one scope-compatible
                     # candidate is ambiguous and is never guessed.
-                    if event.trace_id is not None and link is not None:
+                    if resolved_trace_id is not None and link is not None:
                         candidate_rows = (
                             await conn.execute(
                                 select(
                                     spans.c.span_id, spans.c.project_id, spans.c.application_id
                                 ).where(
                                     spans.c.tenant_id == event.tenant_id,
-                                    spans.c.trace_id == event.trace_id,
+                                    spans.c.trace_id == resolved_trace_id,
                                 )
                             )
                         ).all()
@@ -342,8 +402,9 @@ class PostgresTelemetryStore(TelemetryStore):
                                 evaluation_id=event.evaluation_id,
                                 project_id=matched_span.project_id,
                                 application_id=matched_span.application_id,
-                                trace_id=event.trace_id,
+                                trace_id=resolved_trace_id,
                                 span_id=matched_span.span_id,
+                                interaction_id=event.interaction_id,
                                 source="span",
                                 now=received_at,
                             )
@@ -363,6 +424,7 @@ class PostgresTelemetryStore(TelemetryStore):
         application_id: str | None,
         trace_id: str | None,
         span_id: str | None,
+        interaction_id: str | None,
         source: str,
         now: datetime,
     ) -> EvaluationLinkRow | None:
@@ -398,6 +460,7 @@ class PostgresTelemetryStore(TelemetryStore):
             application_id=application_id,
             trace_id=trace_id,
             span_id=span_id,
+            interaction_id=interaction_id,
             source=source,  # type: ignore[arg-type]
             now=now,
             window=self._reconciliation_window,
@@ -439,6 +502,7 @@ class PostgresTelemetryStore(TelemetryStore):
                 application_id=application_id,
                 trace_id=trace_id,
                 span_id=span_id,
+                interaction_id=interaction_id,
                 source=source,  # type: ignore[arg-type]
                 now=now,
             )
@@ -716,6 +780,7 @@ class PostgresTelemetryStore(TelemetryStore):
                             application_id=span.application_id,
                             trace_id=span.trace_id,
                             span_id=span.span_id,
+                            interaction_id=span.interaction_id,
                             source="span",
                             now=received_at,
                         )
@@ -763,9 +828,73 @@ class PostgresTelemetryStore(TelemetryStore):
                             application_id=span.application_id,
                             trace_id=span.trace_id,
                             span_id=span.span_id,
+                            interaction_id=span.interaction_id,
                             source="span",
                             now=received_at,
                         )
+
+                    # G6_FINAL_REVIEW_2026-10-24.md: the reverse of the
+                    # interaction-only resolution `record_reliability_event`
+                    # performs -- a span arriving *after* an interaction-only
+                    # event (so the link's trace_id is still unknown) can
+                    # now supply the missing trace, the same uniqueness rule
+                    # applied in the other direction. Every PENDING link
+                    # still waiting on a trace for this interaction_id is
+                    # re-checked, since this new span may be exactly what
+                    # breaks (or resolves) its ambiguity.
+                    if span.interaction_id is not None:
+                        pending_links_rows = (
+                            await conn.execute(
+                                select(
+                                    evaluation_links.c.evaluation_id,
+                                    evaluation_links.c.project_id,
+                                    evaluation_links.c.application_id,
+                                ).where(
+                                    evaluation_links.c.tenant_id == span.tenant_id,
+                                    evaluation_links.c.interaction_id == span.interaction_id,
+                                    evaluation_links.c.trace_id.is_(None),
+                                    evaluation_links.c.state == PENDING,
+                                )
+                            )
+                        ).all()
+                        if pending_links_rows:
+                            interaction_span_rows = (
+                                await conn.execute(
+                                    select(
+                                        spans.c.trace_id,
+                                        spans.c.project_id,
+                                        spans.c.application_id,
+                                    ).where(
+                                        spans.c.tenant_id == span.tenant_id,
+                                        spans.c.interaction_id == span.interaction_id,
+                                    )
+                                )
+                            ).all()
+                            interaction_candidates = [
+                                InteractionSpanCandidate(
+                                    row.trace_id, row.project_id, row.application_id
+                                )
+                                for row in interaction_span_rows
+                            ]
+                            for pending_link_row in pending_links_rows:
+                                resolved = select_unique_trace_for_interaction(
+                                    link_project_id=pending_link_row.project_id,
+                                    link_application_id=pending_link_row.application_id,
+                                    candidates=interaction_candidates,
+                                )
+                                if resolved is not None:
+                                    await self._touch_evaluation_link(
+                                        conn,
+                                        tenant_id=span.tenant_id,
+                                        evaluation_id=pending_link_row.evaluation_id,
+                                        project_id=pending_link_row.project_id,
+                                        application_id=pending_link_row.application_id,
+                                        trace_id=resolved,
+                                        span_id=None,
+                                        interaction_id=span.interaction_id,
+                                        source="span",
+                                        now=received_at,
+                                    )
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not record span {span.span_id!r} for trace {span.trace_id!r}: {exc}"

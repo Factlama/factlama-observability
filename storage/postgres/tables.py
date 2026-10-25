@@ -93,6 +93,10 @@ spans = Table(
     Column("received_at", DateTime(timezone=True), nullable=False),
     Index("ix_spans_tenant_trace", "tenant_id", "trace_id"),
     Index("ix_spans_tenant_evaluation", "tenant_id", "evaluation_id"),
+    # G6_FINAL_REVIEW_2026-10-24.md: interaction-only correlation needs to
+    # find every span sharing one (tenant_id, interaction_id) to decide
+    # whether exactly one distinct trace_id is scope-compatible.
+    Index("ix_spans_tenant_interaction", "tenant_id", "interaction_id"),
 )
 
 evaluation_links = Table(
@@ -108,10 +112,17 @@ evaluation_links = Table(
     Column("application_id", String(128), nullable=True),
     Column("trace_id", String(32), nullable=True),
     Column("span_id", String(16), nullable=True),
+    # ADR-021: "Interaction-only matches remain pending when ambiguous;
+    # do not guess a trace." Fixed forever at whatever the first toucher
+    # supplied (`touch_link`'s same "scope fixed at first touch" rule),
+    # so a link resolved via this interaction_id to one trace_id does not
+    # silently re-resolve to a different trace later.
+    Column("interaction_id", String(128), nullable=True),
     Column("state", String(32), nullable=False),
     Column("first_received_at", DateTime(timezone=True), nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=True),
     Column("event_received", Boolean, nullable=False, server_default="false"),
     Column("span_received", Boolean, nullable=False, server_default="false"),
     Index("ix_evaluation_links_tenant_trace", "tenant_id", "trace_id"),
+    Index("ix_evaluation_links_tenant_interaction", "tenant_id", "interaction_id"),
 )

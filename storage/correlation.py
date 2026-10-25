@@ -44,6 +44,7 @@ class EvaluationLinkRow:
     application_id: str | None
     trace_id: str | None
     span_id: str | None
+    interaction_id: str | None
     state: str
     first_received_at: datetime
     expires_at: datetime | None
@@ -59,6 +60,7 @@ def new_link(
     application_id: str | None,
     trace_id: str | None,
     span_id: str | None,
+    interaction_id: str | None,
     source: TouchSource,
     now: datetime,
     window: timedelta,
@@ -76,6 +78,7 @@ def new_link(
         application_id=application_id,
         trace_id=trace_id,
         span_id=span_id,
+        interaction_id=interaction_id,
         state=PENDING,
         first_received_at=now,
         expires_at=now + window,
@@ -100,6 +103,7 @@ def touch_link(
     application_id: str | None,
     trace_id: str | None,
     span_id: str | None,
+    interaction_id: str | None,
     source: TouchSource,
     now: datetime,
 ) -> EvaluationLinkRow:
@@ -154,6 +158,15 @@ def touch_link(
             f"evaluation {existing.evaluation_id!r}: span_id {span_id!r} disagrees with the "
             f"link's established {existing.span_id!r}"
         )
+    if (
+        interaction_id is not None
+        and existing.interaction_id is not None
+        and interaction_id != existing.interaction_id
+    ):
+        raise EvaluationLinkConflict(
+            f"evaluation {existing.evaluation_id!r}: interaction_id {interaction_id!r} disagrees "
+            f"with the link's established {existing.interaction_id!r}"
+        )
 
     updated = replace(
         existing,
@@ -161,6 +174,7 @@ def touch_link(
         application_id=existing.application_id or application_id,
         trace_id=existing.trace_id or trace_id,
         span_id=existing.span_id or span_id,
+        interaction_id=existing.interaction_id or interaction_id,
         event_received=existing.event_received or source == "event",
         span_received=existing.span_received or source == "span",
     )
@@ -241,6 +255,44 @@ def select_unique_matching_link(
         and (candidate.span_id is None or candidate.span_id == span_id)
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+@dataclass(frozen=True)
+class InteractionSpanCandidate:
+    """The minimal shape of one stored span sharing a candidate link's
+    `interaction_id` -- never the full `NormalizedSpan`, same rationale
+    as `SpanIdentity`."""
+
+    trace_id: str
+    project_id: str | None
+    application_id: str | None
+
+
+def select_unique_trace_for_interaction(
+    *,
+    link_project_id: str | None,
+    link_application_id: str | None,
+    candidates: list[InteractionSpanCandidate],
+) -> str | None:
+    """G6_FINAL_REVIEW_2026-10-24.md: "Interaction-only unique/ambiguous
+    matching ... [is] not established by the current evaluation-ID-centric
+    matching." ADR-021: "Interaction-only matches remain pending when
+    ambiguous; do not guess a trace." Candidates are every span sharing
+    one `(tenant_id, interaction_id)`, scope-filtered the same way
+    `select_unique_matching_span` filters by the link's own established
+    scope (missing scope is not a wildcard). Returns the one distinct
+    `trace_id` among scope-compatible candidates; zero or more than one
+    distinct trace is ambiguous and is never guessed -- deliberately
+    distinct from `select_unique_matching_span`, which disambiguates by
+    *span* identity within one already-known trace, not by *trace*
+    identity across many."""
+    matching_traces = {
+        candidate.trace_id
+        for candidate in candidates
+        if candidate.project_id == link_project_id
+        and candidate.application_id == link_application_id
+    }
+    return next(iter(matching_traces)) if len(matching_traces) == 1 else None
 
 
 def derive_trace_evaluation_state(link_states: list[str]) -> str:

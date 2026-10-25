@@ -14,6 +14,7 @@ from storage.correlation import (
     RECONCILIATION_EXPIRED,
     EvaluationLinkConflict,
     EvaluationLinkRow,
+    InteractionSpanCandidate,
     LinkIdentity,
     SpanIdentity,
     apply_lazy_expiry,
@@ -21,6 +22,7 @@ from storage.correlation import (
     new_link,
     select_unique_matching_link,
     select_unique_matching_span,
+    select_unique_trace_for_interaction,
     touch_link,
 )
 
@@ -36,6 +38,7 @@ def _new(source: str = "event", **overrides: object) -> EvaluationLinkRow:
         "application_id": None,
         "trace_id": "trace-1",
         "span_id": None,
+        "interaction_id": None,
         "source": source,
         "now": NOW,
         "window": WINDOW,
@@ -67,6 +70,7 @@ class TestBothOrderMatching:
             application_id=None,
             trace_id="trace-1",
             span_id="span-1",
+            interaction_id=None,
             source="span",
             now=NOW + timedelta(minutes=5),
         )
@@ -81,6 +85,7 @@ class TestBothOrderMatching:
             application_id=None,
             trace_id="trace-1",
             span_id=None,
+            interaction_id=None,
             source="event",
             now=NOW + timedelta(minutes=5),
         )
@@ -94,6 +99,7 @@ class TestBothOrderMatching:
             application_id=None,
             trace_id="trace-1",
             span_id=None,
+            interaction_id=None,
             source="event",
             now=NOW + timedelta(minutes=1),
         )
@@ -122,6 +128,7 @@ class TestExpiry:
             application_id=None,
             trace_id="trace-1",
             span_id="span-1",
+            interaction_id=None,
             source="span",
             now=after_deadline,
         )
@@ -136,6 +143,7 @@ class TestExpiry:
             application_id=None,
             trace_id="trace-1",
             span_id="span-1",
+            interaction_id=None,
             source="span",
             now=NOW + timedelta(minutes=5),
         )
@@ -154,6 +162,7 @@ class TestConflicts:
                 application_id=None,
                 trace_id="trace-2",
                 span_id=None,
+                interaction_id=None,
                 source="span",
                 now=NOW + timedelta(minutes=1),
             )
@@ -167,6 +176,7 @@ class TestConflicts:
                 application_id=None,
                 trace_id="trace-1",
                 span_id=None,
+                interaction_id=None,
                 source="span",
                 now=NOW + timedelta(minutes=1),
             )
@@ -179,6 +189,7 @@ class TestConflicts:
             application_id=None,
             trace_id="trace-1",
             span_id=None,
+            interaction_id=None,
             source="span",
             now=NOW + timedelta(minutes=1),
         )
@@ -198,6 +209,7 @@ class TestConflicts:
                 application_id=None,
                 trace_id="trace-1",
                 span_id=None,
+                interaction_id=None,
                 source="span",
                 now=NOW + timedelta(minutes=1),
             )
@@ -213,6 +225,7 @@ class TestConflicts:
             application_id=None,
             trace_id="trace-1",
             span_id=None,
+            interaction_id=None,
             source="span",
             now=NOW + timedelta(minutes=1),
         )
@@ -233,6 +246,7 @@ class TestConflicts:
                 application_id=None,
                 trace_id="trace-1",
                 span_id=None,
+                interaction_id=None,
                 source="span",
                 now=NOW + timedelta(minutes=1),
             )
@@ -364,3 +378,116 @@ class TestSelectUniqueMatchingLink:
             span_id="s1", span_project_id="p", span_application_id="a", candidates=candidates
         )
         assert matched is None
+
+
+class TestSelectUniqueTraceForInteraction:
+    """G6_FINAL_REVIEW_2026-10-24.md: "Interaction-only unique/ambiguous
+    matching ... [is] not established by the current evaluation-ID-centric
+    matching." ADR-021: "Interaction-only matches remain pending when
+    ambiguous; do not guess a trace.\""""
+
+    def test_a_single_scope_compatible_trace_is_selected(self) -> None:
+        candidates = [InteractionSpanCandidate(trace_id="t1", project_id="p", application_id="a")]
+        matched = select_unique_trace_for_interaction(
+            link_project_id="p", link_application_id="a", candidates=candidates
+        )
+        assert matched == "t1"
+
+    def test_multiple_spans_in_the_same_trace_still_resolve_uniquely(self) -> None:
+        """Two spans sharing one interaction_id in the *same* trace is not
+        ambiguity -- only a *different* distinct trace_id is."""
+        candidates = [
+            InteractionSpanCandidate(trace_id="t1", project_id="p", application_id="a"),
+            InteractionSpanCandidate(trace_id="t1", project_id="p", application_id="a"),
+        ]
+        matched = select_unique_trace_for_interaction(
+            link_project_id="p", link_application_id="a", candidates=candidates
+        )
+        assert matched == "t1"
+
+    def test_two_distinct_traces_are_ambiguous(self) -> None:
+        candidates = [
+            InteractionSpanCandidate(trace_id="t1", project_id="p", application_id="a"),
+            InteractionSpanCandidate(trace_id="t2", project_id="p", application_id="a"),
+        ]
+        matched = select_unique_trace_for_interaction(
+            link_project_id="p", link_application_id="a", candidates=candidates
+        )
+        assert matched is None
+
+    def test_a_scope_mismatch_is_never_selected(self) -> None:
+        candidates = [
+            InteractionSpanCandidate(trace_id="t1", project_id="other", application_id=None)
+        ]
+        matched = select_unique_trace_for_interaction(
+            link_project_id="p", link_application_id="a", candidates=candidates
+        )
+        assert matched is None
+
+    def test_no_candidates_selects_nothing(self) -> None:
+        matched = select_unique_trace_for_interaction(
+            link_project_id="p", link_application_id="a", candidates=[]
+        )
+        assert matched is None
+
+    def test_a_second_distinct_trace_outside_the_link_scope_does_not_cause_ambiguity(
+        self,
+    ) -> None:
+        """Scope filtering happens before distinctness is checked --
+        a candidate in a different scope never counts toward
+        ambiguity, even if it names a second trace."""
+        candidates = [
+            InteractionSpanCandidate(trace_id="t1", project_id="p", application_id="a"),
+            InteractionSpanCandidate(trace_id="t2", project_id="other", application_id=None),
+        ]
+        matched = select_unique_trace_for_interaction(
+            link_project_id="p", link_application_id="a", candidates=candidates
+        )
+        assert matched == "t1"
+
+
+class TestInteractionIdConsistency:
+    def test_a_disagreeing_interaction_id_is_rejected(self) -> None:
+        link = _new(source="event", interaction_id="int-1")
+        with pytest.raises(EvaluationLinkConflict):
+            touch_link(
+                link,
+                project_id=None,
+                application_id=None,
+                trace_id="trace-1",
+                span_id=None,
+                interaction_id="int-2",
+                source="span",
+                now=NOW + timedelta(minutes=1),
+            )
+
+    def test_a_matching_interaction_id_is_accepted(self) -> None:
+        link = _new(source="event", interaction_id="int-1")
+        touched = touch_link(
+            link,
+            project_id=None,
+            application_id=None,
+            trace_id="trace-1",
+            span_id=None,
+            interaction_id="int-1",
+            source="span",
+            now=NOW + timedelta(minutes=1),
+        )
+        assert touched.interaction_id == "int-1"
+
+    def test_interaction_id_is_fixed_forever_at_first_touch(self) -> None:
+        """Mirrors the existing project/application-scope rule: a later
+        touch supplying no interaction_id at all does not erase one the
+        link already established."""
+        link = _new(source="event", interaction_id="int-1")
+        touched = touch_link(
+            link,
+            project_id=None,
+            application_id=None,
+            trace_id="trace-1",
+            span_id=None,
+            interaction_id=None,
+            source="span",
+            now=NOW + timedelta(minutes=1),
+        )
+        assert touched.interaction_id == "int-1"
