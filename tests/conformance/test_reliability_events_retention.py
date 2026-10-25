@@ -7,13 +7,15 @@ way any real future caller would have to.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
+import pytest
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from schemas.tenancy import TenantContext
 from storage.postgres.backend import PostgresTelemetryStore
-from storage.postgres.tables import evaluation_links, reliability_events
+from storage.postgres.tables import evaluation_links, reliability_events, retired_evaluations
 from tests.conformance.conftest import make_event, make_span
 
 TENANT_A = TenantContext(tenant_id="tenant-a")
@@ -392,3 +394,84 @@ async def test_a_retired_identity_blocks_a_fresh_span_only_touch(
     span = make_span(evaluation_id="eval-1")
     await store.record_normalized_span(span)
     assert not await _link_exists(engine, "tenant-a", "eval-1")
+
+
+async def test_retirement_cannot_be_raced_by_a_concurrent_new_arrival(
+    store: PostgresTelemetryStore, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 (review-evidence/g6-retirement-review-2026-10-25): a bare
+    `retired_evaluations` check in `_touch_evaluation_link` does not
+    serialize with `delete_reliability_events`'s own tombstone write --
+    both ran in separate transactions, so a touch's check could return
+    "not retired" and only create its fresh link *after* retention had
+    already committed that identity's tombstone. Deterministically forces
+    exactly that interleaving: pauses a second arrival (a new event_id
+    replaying the same evaluation_id) immediately after its own fast,
+    unlocked tombstone check returns "not retired," runs retention to
+    completion while it is paused there, then lets it resume and attempt
+    its insert. The fix must still refuse to revive the identity."""
+    span = make_span(evaluation_id="eval-1", trace_id="0123456789abcdef0123456789abcdef")
+    original_event = make_event(
+        event_id="original", evaluation_id="eval-1", trace_id=span.trace_id, span_id=span.span_id
+    )
+    await store.record_reliability_event(original_event)
+
+    old = datetime.now(timezone.utc) - timedelta(days=6)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(evaluation_links).values(
+                state="RECONCILIATION_EXPIRED",
+                first_received_at=old,
+                expires_at=old + timedelta(hours=24),
+            )
+        )
+        await conn.execute(update(reliability_events).values(received_at=old))
+
+    checked_tombstone = asyncio.Event()
+    resume_arrival = asyncio.Event()
+    original_execute = AsyncConnection.execute
+
+    async def paused_execute(
+        self: AsyncConnection, statement: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        result = await original_execute(self, statement, *args, **kwargs)
+        sql = str(statement)
+        if (
+            asyncio.current_task() is not None
+            and asyncio.current_task().get_name() == "new-arrival"  # type: ignore[union-attr]
+            and sql.startswith("SELECT")
+            and "FROM retired_evaluations" in sql
+        ):
+            checked_tombstone.set()
+            await asyncio.wait_for(resume_arrival.wait(), 5)
+        return result
+
+    monkeypatch.setattr(AsyncConnection, "execute", paused_execute)
+    new_arrival = make_event(event_id="replay", evaluation_id="eval-1", trace_id=span.trace_id)
+    arrival_task = asyncio.create_task(
+        store.record_reliability_event(new_arrival), name="new-arrival"
+    )
+    try:
+        await asyncio.wait_for(checked_tombstone.wait(), 5)
+        await store.delete_reliability_events(
+            "tenant-a", before=datetime.now(timezone.utc) + timedelta(seconds=1)
+        )
+    finally:
+        resume_arrival.set()
+    await arrival_task
+
+    async with engine.connect() as conn:
+        assert (
+            await conn.execute(
+                select(retired_evaluations).where(
+                    retired_evaluations.c.tenant_id == "tenant-a",
+                    retired_evaluations.c.evaluation_id == "eval-1",
+                )
+            )
+        ).first() is not None
+    assert not await _link_exists(engine, "tenant-a", "eval-1")
+
+    await store.record_normalized_span(span)
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value != "AVAILABLE"

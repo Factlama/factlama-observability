@@ -23,7 +23,7 @@ from typing import Any
 
 from asyncpg import PostgresError  # type: ignore[import-untyped]
 from prometheus_client import Counter
-from sqlalchemy import and_, delete, exists, literal, or_, select, tuple_, update
+from sqlalchemy import and_, delete, exists, func, literal, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -466,6 +466,44 @@ class PostgresTelemetryStore(TelemetryStore):
             self._reconciliation_conflict_total.inc(conflict_delta_total)
         return inserted is not None
 
+    async def _lock_evaluation_identity(
+        self, conn: AsyncConnection, tenant_id: str, evaluation_id: str
+    ) -> None:
+        """R1 (review-evidence/g6-retirement-review-2026-10-25): serializes
+        every path that can create or revive a link for one evaluation
+        identity against `delete_reliability_events`'s own tombstone-then-
+        delete for that same identity. A transaction-scoped Postgres
+        advisory lock -- released automatically on commit or rollback,
+        never needing an explicit unlock that a crash could skip -- keyed
+        by a hash of (tenant_id, evaluation_id). `hashtext()` is not
+        collision-free, but a collision here only ever makes two unrelated
+        identities serialize against each other; it can never make an
+        identity go unprotected, so it is safe to use for this purpose.
+
+        Acquired before the caller reads `retired_evaluations` or decides
+        what to tombstone, so that whichever side gets here first finishes
+        its *entire* transaction -- commit or rollback -- before the other
+        proceeds. A bare `SELECT` from `retired_evaluations` with no lock
+        cannot close this gap on its own: it only ever answers "was this
+        identity retired as of a moment that already passed," and a second
+        transaction can still write the tombstone in the gap between that
+        answer and this one's own write."""
+        await conn.execute(
+            select(
+                func.pg_advisory_xact_lock(func.hashtext(tenant_id), func.hashtext(evaluation_id))
+            )
+        )
+
+    async def _is_retired(self, conn: AsyncConnection, tenant_id: str, evaluation_id: str) -> bool:
+        return (
+            await conn.execute(
+                select(1).where(
+                    retired_evaluations.c.tenant_id == tenant_id,
+                    retired_evaluations.c.evaluation_id == evaluation_id,
+                )
+            )
+        ).first() is not None
+
     async def _touch_evaluation_link(
         self,
         conn: AsyncConnection,
@@ -523,15 +561,23 @@ class PostgresTelemetryStore(TelemetryStore):
         the replay boundary; the deletion floor on the full marker row
         only ever governed when that row becomes eligible for removal,
         never whether the identity could be revived afterward."""
-        retired = (
-            await conn.execute(
-                select(1).where(
-                    retired_evaluations.c.tenant_id == tenant_id,
-                    retired_evaluations.c.evaluation_id == evaluation_id,
-                )
-            )
-        ).first()
-        if retired is not None:
+        # R1 (review-evidence/g6-retirement-review-2026-10-25): unlocked
+        # fast path -- cheap, and correct on its own for the overwhelming
+        # majority of calls, where nothing is concurrently retiring this
+        # exact identity. Deliberately NOT locked: a real, authoritative
+        # recheck only has to happen around the one branch below that can
+        # actually revive a retired identity (a brand-new row, with no
+        # existing row for Postgres's own unique index to naturally
+        # serialize against) -- see the comment at that branch. Guarding
+        # every touch unconditionally here, before this caller's own
+        # earlier work in this transaction, would block
+        # `delete_reliability_events`'s own lock attempt on this identity
+        # for that whole span even though retention's actual work is
+        # fast, and would also defeat the ordinary existing-row
+        # conflict/merge path's own concurrency (two genuinely concurrent
+        # first arrivals for the same identity, unrelated to retirement,
+        # rely on reaching their own `INSERT ... ON CONFLICT` together).
+        if await self._is_retired(conn, tenant_id, evaluation_id):
             return None, 0, 0
 
         link = new_link(
@@ -555,6 +601,34 @@ class PostgresTelemetryStore(TelemetryStore):
             )
         ).first()
         if inserted is not None:
+            # R1 (review-evidence/g6-retirement-review-2026-10-25): this
+            # is exactly the dangerous branch -- a brand-new row, with no
+            # existing row for Postgres's own unique index to naturally
+            # serialize this against `delete_reliability_events`'s own
+            # tombstone-then-delete of the *same* identity. The fast
+            # check above can be stale (it ran before this insert, and a
+            # concurrent retention run could have committed its tombstone
+            # in between): only this authoritative, lock-protected
+            # recheck -- taken immediately after the row exists, before
+            # this transaction commits it -- can close that gap. The lock
+            # is `delete_reliability_events`'s own per-identity lock (see
+            # `_lock_evaluation_identity`), so whichever side gets here
+            # first for this identity finishes its whole transaction
+            # before the other proceeds. If retention already committed,
+            # this recheck sees the tombstone and this insert is undone
+            # before anything else can observe it; if retention is still
+            # waiting for this same lock, it will see this transaction's
+            # own fresh row once it gets to act, and correctly skip
+            # tombstoning an identity that is not actually source-free.
+            await self._lock_evaluation_identity(conn, tenant_id, evaluation_id)
+            if await self._is_retired(conn, tenant_id, evaluation_id):
+                await conn.execute(
+                    delete(evaluation_links).where(
+                        evaluation_links.c.tenant_id == tenant_id,
+                        evaluation_links.c.evaluation_id == evaluation_id,
+                    )
+                )
+                return None, 0, 0
             return link, 0, 0  # this transaction created the row fresh; nothing more to merge
 
         existing_row = (
@@ -791,31 +865,44 @@ class PostgresTelemetryStore(TelemetryStore):
             evaluation_links.c.expires_at < replay_eligible_before,
             *no_source_remains,
         )
-        link_clauses: list[ColumnElement[bool]] = [
-            evaluation_links.c.tenant_id == tenant_id,
-            or_(
-                and_(
-                    evaluation_links.c.state != RECONCILIATION_EXPIRED,
-                    evaluation_links.c.first_received_at < before,
-                    *no_source_remains,
-                ),
-                expired_and_eligible,
-            ),
-        ]
-        expired_marker_clauses: list[ColumnElement[bool]] = [
-            evaluation_links.c.tenant_id == tenant_id,
-            expired_and_eligible,
-        ]
+        scope_clauses: list[ColumnElement[bool]] = []
         if project_id is not None:
             event_clauses.append(reliability_events.c.project_id == project_id)
             span_clauses.append(spans.c.project_id == project_id)
-            link_clauses.append(evaluation_links.c.project_id == project_id)
-            expired_marker_clauses.append(evaluation_links.c.project_id == project_id)
+            scope_clauses.append(evaluation_links.c.project_id == project_id)
         if application_id is not None:
             event_clauses.append(reliability_events.c.application_id == application_id)
             span_clauses.append(spans.c.application_id == application_id)
-            link_clauses.append(evaluation_links.c.application_id == application_id)
-            expired_marker_clauses.append(evaluation_links.c.application_id == application_id)
+            scope_clauses.append(evaluation_links.c.application_id == application_id)
+
+        def _clauses_for(
+            eligible: ColumnElement[bool],
+        ) -> tuple[list[ColumnElement[bool]], list[ColumnElement[bool]]]:
+            link = [
+                evaluation_links.c.tenant_id == tenant_id,
+                *scope_clauses,
+                or_(
+                    and_(
+                        evaluation_links.c.state != RECONCILIATION_EXPIRED,
+                        evaluation_links.c.first_received_at < before,
+                        *no_source_remains,
+                    ),
+                    eligible,
+                ),
+            ]
+            marker = [
+                evaluation_links.c.tenant_id == tenant_id,
+                *scope_clauses,
+                eligible,
+            ]
+            return link, marker
+
+        # Discovery only -- not yet safe to act on, since nothing has
+        # locked these identities against a concurrent touch yet. The
+        # R1 lock loop inside the transaction below turns this into the
+        # authoritative, race-safe set actually used for the tombstone
+        # write and the matching delete.
+        _, discovery_marker_clauses = _clauses_for(expired_and_eligible)
         expired_rowcount = 0
         try:
             async with self._engine.begin() as conn:
@@ -848,6 +935,65 @@ class PostgresTelemetryStore(TelemetryStore):
                 expired_rowcount = expiry_result.rowcount
                 event_result = await conn.execute(delete(reliability_events).where(*event_clauses))
                 await conn.execute(delete(spans).where(*span_clauses))
+
+                # R1 (review-evidence/g6-retirement-review-2026-10-25): a
+                # bare tombstone check in `_touch_evaluation_link` races
+                # this method's own tombstone write -- a concurrent touch
+                # for the same identity can check `retired_evaluations`,
+                # find nothing, and only create its fresh link *after*
+                # this method has already committed that identity's
+                # tombstone. Locking every candidate identity here, before
+                # writing anything, forces whichever side arrives first to
+                # finish its entire transaction before the other proceeds:
+                # if this method gets there first, the touch's own check
+                # (now serialized behind the same lock) sees the committed
+                # tombstone and refuses; if the touch gets there first,
+                # this method blocks until that touch's transaction
+                # commits, and the re-query below then naturally excludes
+                # that identity (it has a fresh source again, so
+                # `no_source_remains` is now false).
+                candidate_ids = sorted(
+                    {
+                        row.evaluation_id
+                        for row in (
+                            await conn.execute(
+                                select(evaluation_links.c.evaluation_id).where(
+                                    *discovery_marker_clauses
+                                )
+                            )
+                        ).all()
+                    }
+                )
+                for candidate_evaluation_id in candidate_ids:
+                    await self._lock_evaluation_identity(conn, tenant_id, candidate_evaluation_id)
+                # Authoritative now that every candidate's lock is held:
+                # re-querying with the exact same (still unrestricted)
+                # clauses picks up only identities that are both still
+                # eligible *and* were actually locked above -- anything
+                # that stopped qualifying while we were acquiring locks
+                # (a touch that got there first and added a fresh source)
+                # drops out on its own; anything that only became eligible
+                # after our candidate scan was never locked, so it is left
+                # for the next retention run rather than acted on unsafely.
+                locked_ids = {
+                    row.evaluation_id
+                    for row in (
+                        await conn.execute(
+                            select(evaluation_links.c.evaluation_id).where(
+                                *discovery_marker_clauses
+                            )
+                        )
+                    ).all()
+                } & set(candidate_ids)
+                locked_restriction = (
+                    evaluation_links.c.evaluation_id.in_(locked_ids)
+                    if locked_ids
+                    else literal(False)
+                )
+                link_clauses, expired_marker_clauses = _clauses_for(
+                    and_(expired_and_eligible, locked_restriction)
+                )
+
                 # F1 (review-evidence/g6-coverage-fix-review-2026-10-25):
                 # write a permanent tombstone for exactly the identities
                 # about to lose their full marker row below -- this, not
@@ -1220,6 +1366,20 @@ class PostgresTelemetryStore(TelemetryStore):
                         )
                         if resolved is None:
                             continue
+                        # R1 (review-evidence/g6-retirement-review-2026-10-25):
+                        # defensive invariant -- lazy reconciliation must
+                        # never promote a retired identity to AVAILABLE,
+                        # even though the race this guards against is
+                        # already closed at the write side by
+                        # `_lock_evaluation_identity`. A tombstoned
+                        # identity with a live PENDING link here would
+                        # only mean some other, not-yet-understood path
+                        # created one; refusing to promote it is strictly
+                        # safer than reconciling it.
+                        if await self._is_retired(
+                            conn, tenant.tenant_id, pending_link.evaluation_id
+                        ):
+                            continue
                         # R2's same fix applies here: resolving the trace
                         # already required a scope-compatible span to
                         # exist sharing this interaction_id -- that is
@@ -1325,6 +1485,14 @@ class PostgresTelemetryStore(TelemetryStore):
                         )
                     )
                     if matched_span is None:
+                        links.append(link)
+                        continue
+
+                    # R1 (review-evidence/g6-retirement-review-2026-10-25):
+                    # same defensive invariant as the interaction-only
+                    # recovery block above -- never persist a promotion
+                    # to AVAILABLE for a retired identity.
+                    if await self._is_retired(conn, tenant.tenant_id, link.evaluation_id):
                         links.append(link)
                         continue
 
