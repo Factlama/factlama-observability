@@ -36,6 +36,7 @@ def _occurred_at(event: ReliabilityEvent) -> datetime:
 TENANT_ONE_KEY = "tenant-one-key"
 TENANT_ONE_SCOPED_KEY = "tenant-one-scoped-key"
 TENANT_TWO_KEY = "tenant-two-key"
+ADMIN_TOKEN = "test-admin-token"
 
 
 class FakeTelemetryStore:
@@ -69,6 +70,34 @@ class FakeTelemetryStore:
             return False
         self._events[key] = event
         return True
+
+    async def delete_reliability_events(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime,
+        project_id: str | None = None,
+        application_id: str | None = None,
+    ) -> int:
+        """Route-level behavior only (auth, serialization, error
+        passthrough) -- coordinated spans/evaluation_links deletion and
+        the never-revive-an-expired-link rule are the real backend's own
+        contract, proven in
+        `tests/conformance/test_reliability_events_retention.py`."""
+        if self.fail_next:
+            self.fail_next = False
+            raise StorageUnavailableError("simulated storage outage")
+        to_delete = [
+            key
+            for key, event in self._events.items()
+            if event.tenant_id == tenant_id
+            and _occurred_at(event) < before
+            and (project_id is None or event.project_id == project_id)
+            and (application_id is None or event.application_id == application_id)
+        ]
+        for key in to_delete:
+            del self._events[key]
+        return len(to_delete)
 
     async def get_reliability_event(
         self, tenant: TenantContext, evaluation_id: str
@@ -200,6 +229,7 @@ def _test_settings() -> Settings:
     )
     settings.database_url = None
     settings.query_cursor_secret = "test-cursor-secret"
+    settings.admin_token = ADMIN_TOKEN
     return settings
 
 
@@ -578,6 +608,84 @@ class TestEvaluationAggregates:
         assert response.status_code == 200
         assert "metrics" in response.json()
         assert "evaluation_id" not in response.json()
+
+
+def _delete_retention(
+    client: TestClient,
+    *,
+    token: str | None,
+    tenant_id: str = "tenant-one",
+    before: str = "2030-01-01T00:00:00Z",
+    project_id: str | None = None,
+    application_id: str | None = None,
+) -> httpx.Response:
+    body: dict[str, str] = {"tenant_id": tenant_id, "before": before}
+    if project_id is not None:
+        body["project_id"] = project_id
+    if application_id is not None:
+        body["application_id"] = application_id
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return client.post("/v0.1/admin/retention/delete", json=body, headers=headers)
+
+
+class TestRetentionDelete:
+    """G6_FINAL_REVIEW_2026-10-24.md: `delete_reliability_events` had no
+    caller at all (cron/admin endpoint/worker tick was "an explicit,
+    unbuilt next decision, not a silent gap"). An admin-authenticated HTTP
+    endpoint, per explicit project-owner direction 2026-10-25."""
+
+    def test_missing_admin_token_is_rejected(self, client: TestClient) -> None:
+        response = _delete_retention(client, token=None)
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "UNAUTHENTICATED"
+
+    def test_wrong_admin_token_is_rejected(self, client: TestClient) -> None:
+        response = _delete_retention(client, token="not-the-admin-token")
+        assert response.status_code == 401
+
+    def test_a_tenant_api_key_does_not_authenticate_as_admin(self, client: TestClient) -> None:
+        """The admin token is a separate credential, never interchangeable
+        with a per-tenant API key -- the two authenticate different
+        things (an operator vs. a tenant)."""
+        response = _delete_retention(client, token=TENANT_ONE_KEY)
+        assert response.status_code == 401
+
+    def test_deletes_events_before_the_given_cutoff(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        old_event = make_event(
+            event_id="old",
+            tenant_id="tenant-one",
+            occurred_at="2020-01-01T00:00:00Z",
+        )
+        new_event = make_event(
+            event_id="new",
+            tenant_id="tenant-one",
+            occurred_at="2029-06-01T00:00:00Z",
+        )
+        _seed(store, old_event)
+        _seed(store, new_event)
+
+        response = _delete_retention(
+            client, token=ADMIN_TOKEN, tenant_id="tenant-one", before="2025-01-01T00:00:00Z"
+        )
+        assert response.status_code == 200
+        assert response.json() == {"schema_version": "0.1", "deleted_count": 1}
+        assert ("tenant-one", "new") in store._events
+        assert ("tenant-one", "old") not in store._events
+
+    def test_a_malformed_before_timestamp_is_rejected(self, client: TestClient) -> None:
+        response = _delete_retention(client, token=ADMIN_TOKEN, before="not-a-timestamp")
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+    def test_storage_outage_is_reported_as_dependency_unavailable(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        store.fail_next = True
+        response = _delete_retention(client, token=ADMIN_TOKEN)
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
 
 
 class TestBackpressure:

@@ -29,7 +29,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import ColumnElement
 
-from schemas.aitrace import AITrace, EvaluationLink, EvaluationLinkState, EvaluationState
+from schemas.aitrace import (
+    AITrace,
+    AITraceUsageSummary,
+    EvaluationLink,
+    EvaluationLinkState,
+    EvaluationState,
+)
+from schemas.aitrace import CostBucket as AITraceCostBucket
 from schemas.normalized_span import NormalizedSpan, OperationType, SpanStatus
 from schemas.reliability_event import (
     OverallVerdict,
@@ -919,6 +926,30 @@ class PostgresTelemetryStore(TelemetryStore):
 
         evaluation_state = derive_trace_evaluation_state([link.state for link in authorized_links])
 
+        # ADR-021: "usage/cost summaries with explicit availability and
+        # grouping metadata." `None` (never an all-zero summary) when
+        # there are no spans at all -- distinct from a summary that
+        # exists but measured nothing (G6_FINAL_REVIEW_2026-10-24.md's
+        # "trace usage summaries ... need itemized acceptance").
+        usage_summary = None
+        if authorized_spans:
+            cost_totals, cost_unavailable_count = _cost_totals_by_bucket(
+                [span.usage.cost.model_dump(mode="json") for span in authorized_spans]
+            )
+            usage_summary = AITraceUsageSummary(
+                cost_buckets=[
+                    AITraceCostBucket(
+                        currency=currency,
+                        pricing_version=pricing_version,
+                        amount=amount,
+                        measured_count=count,
+                    )
+                    for currency, pricing_version, amount, count in cost_totals
+                ],
+                cost_unavailable_count=cost_unavailable_count,
+                cost_coverage_complete=cost_unavailable_count == 0,
+            )
+
         return AITrace(
             tenant_id=tenant.tenant_id,
             project_id=project_id,
@@ -927,6 +958,7 @@ class PostgresTelemetryStore(TelemetryStore):
             started_at=min((s.started_at for s in authorized_spans), default=None),
             ended_at=max((s.ended_at for s in authorized_spans), default=None),
             spans=authorized_spans,
+            usage_summary=usage_summary,
             evaluation_links=[
                 EvaluationLink(
                     evaluation_id=link.evaluation_id,
@@ -958,17 +990,26 @@ def _aggregate_rows(rows: Sequence[Any]) -> list[CalibrationClassAggregate]:
     ]
 
 
-def _aggregate_one_class(calibration_class: str, rows: Sequence[Any]) -> CalibrationClassAggregate:
-    # Keyed by (currency, pricing_version) -- ADR-021: "Group cost by the
-    # tuple (currency, pricing source, pricing version) ... a list of
-    # versions beside one pooled amount is not separate grouping."
-    # `pricing_version=None` is itself a distinct key (an explicit
-    # "measured but no recorded pricing-version provenance" bucket), never
-    # merged into a specific version's total for the same currency.
+def _cost_totals_by_bucket(
+    cost_jsons: Sequence[dict[str, Any]],
+) -> tuple[list[tuple[str, str | None, float, int]], int]:
+    """Groups a sequence of `Cost`-shaped dicts (`Usage.cost`, from either
+    a `ReliabilityEvent` or a `NormalizedSpan` -- both share the same
+    `Usage`/`Cost` types) by (currency, pricing_version) -- ADR-021:
+    "Group cost by the tuple (currency, pricing source, pricing version)
+    ... a list of versions beside one pooled amount is not separate
+    grouping." `pricing_version=None` is itself a distinct key (an
+    explicit "measured but no recorded pricing-version provenance"
+    bucket), never merged into a specific version's total for the same
+    currency. Shared by `_aggregate_one_class` (evaluation aggregates) and
+    `PostgresTelemetryStore.get_trace` (trace usage summary) -- each
+    builds its own bucket type (`storage.aggregates.CostBucket` vs.
+    `schemas.aitrace.CostBucket`) from these plain tuples, so the two
+    never drift on the grouping rule itself. Each tuple is
+    (currency, pricing_version, amount, measured_count)."""
     cost_totals: dict[tuple[str, str | None], dict[str, Any]] = {}
-    cost_unavailable_count = 0
-    for row in rows:
-        cost = row.usage_summary_json.get("cost") or {}
+    unavailable_count = 0
+    for cost in cost_jsons:
         if (
             cost.get("status") == "MEASURED"
             and cost.get("currency")
@@ -980,18 +1021,13 @@ def _aggregate_one_class(calibration_class: str, rows: Sequence[Any]) -> Calibra
             bucket["measured_count"] += 1
         else:
             # Missing/UNAVAILABLE cost is never treated as zero and never
-            # silently excluded from the class's own count -- it is its own
-            # explicit counter, so a caller can tell "we know this class
-            # cost nothing" apart from "we don't know what this class cost."
-            cost_unavailable_count += 1
+            # silently excluded from the count -- it is its own explicit
+            # counter, so a caller can tell "we know this cost nothing"
+            # apart from "we don't know what this cost."
+            unavailable_count += 1
 
-    cost_buckets = [
-        CostBucket(
-            currency=currency,
-            pricing_version=pricing_version,
-            amount=bucket["amount"],
-            measured_count=bucket["measured_count"],
-        )
+    buckets = [
+        (currency, pricing_version, bucket["amount"], bucket["measured_count"])
         # None sorts before every str in Python 3's comparison rules for
         # same-type tuples, but str vs None across different rows in a
         # mixed sort raises TypeError -- sort on a key that substitutes ""
@@ -999,6 +1035,19 @@ def _aggregate_one_class(calibration_class: str, rows: Sequence[Any]) -> Calibra
         for (currency, pricing_version), bucket in sorted(
             cost_totals.items(), key=lambda item: (item[0][0], item[0][1] or "")
         )
+    ]
+    return buckets, unavailable_count
+
+
+def _aggregate_one_class(calibration_class: str, rows: Sequence[Any]) -> CalibrationClassAggregate:
+    cost_totals, cost_unavailable_count = _cost_totals_by_bucket(
+        [row.usage_summary_json.get("cost") or {} for row in rows]
+    )
+    cost_buckets = [
+        CostBucket(
+            currency=currency, pricing_version=pricing_version, amount=amount, measured_count=count
+        )
+        for currency, pricing_version, amount, count in cost_totals
     ]
 
     score_values: dict[str, list[dict[str, Any]]] = {}

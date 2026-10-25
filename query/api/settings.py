@@ -42,6 +42,17 @@ class Settings:
         self.max_concurrent_requests = int(
             optional_env("FACTLAMA_MAX_CONCURRENT_REQUESTS", str(DEFAULT_MAX_CONCURRENT_REQUESTS))
         )
+        # G6_FINAL_REVIEW_2026-10-24.md's "trace usage summaries and
+        # retention operational horizon need itemized acceptance" gap --
+        # `delete_reliability_events` previously had no caller at all
+        # (cron/admin endpoint/worker tick was "an explicit, unbuilt next
+        # decision, not a silent gap", EXECUTION_PLAN.md). A shared-secret
+        # bearer token, same minimal shape as
+        # `collector/ingress/auth.py::authenticate_workload` -- this is an
+        # operator/admin-authenticated maintenance call, not a per-tenant
+        # credential. Unconfigured (`None`) authenticates nothing, the
+        # same fail-closed rule that module already documents.
+        self.admin_token = os.environ.get("FACTLAMA_ADMIN_TOKEN")
         # ADR-021: "Cursors bind authenticated tenant/project/application
         # scope, resolved window, filters, sort order, query version and
         # finite expiry, with integrity protection." This HMAC-signs that

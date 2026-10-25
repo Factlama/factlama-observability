@@ -14,6 +14,7 @@ independent, tenant-facing reader of the same storage, not part of the
 internal ingestion path.
 """
 
+import hmac
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from operations.concurrency import ConcurrencyLimiter
 from operations.metrics import install_metrics
@@ -115,6 +117,24 @@ def authenticate(
     if tenant_context is None:
         raise QueryError(QueryErrorCode.UNAUTHENTICATED, "missing or invalid API key")
     return tenant_context
+
+
+def authenticate_admin(
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    """Verify the caller holds the shared admin/maintenance token --
+    mirrors `collector/ingress/auth.py::authenticate_workload` exactly
+    (same minimal, config-driven shared-secret shape, same fail-closed
+    rule when unconfigured). Not a `TenantContext`: a retention deletion
+    is an operator-authorized maintenance call, not a per-tenant read."""
+    token = _extract_bearer_token(authorization)
+    if (
+        settings.admin_token is None
+        or token is None
+        or not hmac.compare_digest(token, settings.admin_token)
+    ):
+        raise QueryError(QueryErrorCode.UNAUTHENTICATED, "missing or invalid admin token")
 
 
 @app.exception_handler(QueryError)
@@ -354,3 +374,48 @@ async def get_trace(
     if trace is None:
         raise QueryError(QueryErrorCode.NOT_FOUND, "trace not found")
     return JSONResponse(status_code=200, content=trace.model_dump(mode="json", exclude_none=True))
+
+
+class RetentionDeleteRequest(BaseModel):
+    """G6_FINAL_REVIEW_2026-10-24.md: `delete_reliability_events` had no
+    caller at all. No default cutoff (per explicit project-owner
+    direction, 2026-10-25): `before` is always required, never implied by
+    a retention-period default, matching this method's existing
+    deliberate design (EXECUTION_PLAN.md: "no default retention period")."""
+
+    tenant_id: str
+    before: str
+    project_id: str | None = None
+    application_id: str | None = None
+
+
+@app.post("/v0.1/admin/retention/delete")
+async def delete_retention(
+    request: RetentionDeleteRequest,
+    _admin: Annotated[None, Depends(authenticate_admin)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+) -> JSONResponse:
+    """The retention-deletion trigger `storage.backend.TelemetryStore.
+    delete_reliability_events` previously had none of (cron/admin
+    endpoint/worker tick, per EXECUTION_PLAN.md's own "explicit, unbuilt
+    next decision" note) -- an admin-authenticated HTTP call, per explicit
+    project-owner direction 2026-10-25. Coordinated deletion of
+    `reliability_events`/`spans`/orphaned `evaluation_links` markers, and
+    never reviving an expired link, are this method's own existing
+    contract (`tests/conformance/test_reliability_events_retention.py`);
+    this route adds no new deletion semantics, only a caller."""
+    before_dt = _parse_timestamp(request.before, "before")
+    try:
+        deleted_count = await store.delete_reliability_events(
+            request.tenant_id,
+            before=before_dt,
+            project_id=request.project_id,
+            application_id=request.application_id,
+        )
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+    return JSONResponse(
+        status_code=200, content={"schema_version": "0.1", "deleted_count": deleted_count}
+    )

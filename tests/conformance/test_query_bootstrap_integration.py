@@ -8,7 +8,9 @@ app, with its real lifespan, against the same live Postgres container the
 rest of this package already proves persistence correctness against.
 """
 
+import asyncio
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,6 +19,8 @@ from testcontainers.community.postgres import PostgresContainer
 
 from query.api.app import app
 from query.api.settings import get_settings
+from storage.postgres.backend import PostgresTelemetryStore
+from tests.conformance.conftest import make_event
 
 
 @pytest.fixture
@@ -29,6 +33,7 @@ def live_app_client(
     _, _, rest = raw.partition("://")
     monkeypatch.setenv("FACTLAMA_DATABASE_URL", f"postgresql+asyncpg://{rest}")
     monkeypatch.setenv("FACTLAMA_TENANT_CREDENTIALS", '{"live-key": {"tenant_id": "tenant-live"}}')
+    monkeypatch.setenv("FACTLAMA_ADMIN_TOKEN", "live-admin-token")
     get_settings.cache_clear()
     try:
         with TestClient(app) as client:
@@ -138,3 +143,36 @@ def test_trace_detail_recovers_after_database_outage(
         admin_sql(f"ALTER DATABASE {database} ALLOW_CONNECTIONS true")
     assert live_app_client.get("/health/ready").status_code == 200
     assert live_app_client.get(path, headers=headers).status_code == 404
+
+
+async def test_admin_retention_delete_through_the_real_composition_root(
+    live_app_client: TestClient, store: PostgresTelemetryStore
+) -> None:
+    """G6_FINAL_REVIEW_2026-10-24.md's "retention operational horizon"
+    acceptance gap: `delete_reliability_events` had no caller at all.
+    Proves the real admin-authenticated route, against the real
+    composition root's own `PostgresTelemetryStore`, actually deletes an
+    old event and leaves a newer one in the same tenant untouched.
+    `received_at` (not `occurred_at`) is the real cutoff column -- set to
+    the real clock at insert time -- so the cutoff is read fresh strictly
+    between the two inserts, the same technique
+    `tests/conformance/test_reliability_events_retention.py` already
+    uses."""
+    await store.record_reliability_event(make_event(event_id="old", tenant_id="tenant-live"))
+    cutoff = datetime.now(timezone.utc) + timedelta(seconds=1)
+    await asyncio.sleep(1.2)
+    await store.record_reliability_event(
+        make_event(event_id="new", tenant_id="tenant-live", evaluation_id="eval-2")
+    )
+
+    response = live_app_client.post(
+        "/v0.1/admin/retention/delete",
+        json={"tenant_id": "tenant-live", "before": cutoff.isoformat()},
+        headers={"Authorization": "Bearer live-admin-token"},
+    )
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 1
+
+    headers = {"Authorization": "Bearer live-key"}
+    assert live_app_client.get("/v0.1/ai/evaluations/eval-1", headers=headers).status_code == 404
+    assert live_app_client.get("/v0.1/ai/evaluations/eval-2", headers=headers).status_code == 200
