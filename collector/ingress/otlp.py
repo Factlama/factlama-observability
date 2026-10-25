@@ -77,12 +77,21 @@ def _hex_id(raw: bytes) -> str:
     return raw.hex()
 
 
-def map_resource_attributes(resource: Resource) -> dict[str, str]:
+def map_resource_attributes(resource: Resource) -> tuple[dict[str, str], int]:
+    """Returns the allowlisted attributes plus how many keys were dropped
+    (outside the allowlist) -- G6_FINAL_REVIEW_2026-10-24.md: "Dropped-attribute
+    counts ... are not wired through the current parser/storage paths."
+    The count, never the raw key names, is what a caller may use as a
+    bounded metric label (ADR-021: "counted by bounded reason labels, not
+    raw key/value labels")."""
     mapped: dict[str, str] = {}
+    dropped = 0
     for kv in resource.attributes:
         if kv.key in RESOURCE_ATTRIBUTE_ALLOWLIST and kv.value.HasField("string_value"):
             mapped[kv.key] = kv.value.string_value
-    return mapped
+        else:
+            dropped += 1
+    return mapped, dropped
 
 
 def _nanos_to_iso(nanos: int) -> str:
@@ -96,9 +105,12 @@ def _nanos_to_iso(nanos: int) -> str:
 
 def parse_span(
     otlp_span: OtlpSpan, *, resource_attributes: dict[str, str], tenant: TenantContext
-) -> NormalizedSpan:
+) -> tuple[NormalizedSpan, int]:
     """Raises `SpanParseError` for any structural or mapping problem with
-    this one span."""
+    this one span. Returns the normalized span plus how many of its own
+    attribute keys were dropped (outside `RECOGNIZED_ATTRIBUTE_KEYS`) --
+    see `map_resource_attributes`'s docstring for why this is a count, not
+    the raw key names."""
     try:
         scope = check_scope_agreement(
             otlp_span.attributes,
@@ -127,7 +139,7 @@ def parse_span(
     status = _OTLP_STATUS_CODE_TO_SPAN_STATUS.get(status_code, SpanStatus.UNSET)
 
     try:
-        return NormalizedSpan(
+        normalized = NormalizedSpan(
             mapping_version=MAPPING_VERSION,
             semconv_version=SEMCONV_VERSION,
             tenant_id=tenant.tenant_id,
@@ -164,3 +176,4 @@ def parse_span(
         # submitted input value verbatim -- a bounded, content-free code
         # instead.
         raise SpanParseError("span failed normalized-span validation") from exc
+    return normalized, len(mapped.dropped_attribute_keys)

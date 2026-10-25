@@ -268,6 +268,47 @@ class TestMetrics:
 
         assert _count(after) == _count(before) + 1
 
+    def test_dropped_attributes_total_counts_unrecognized_span_attributes(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        """G6_FINAL_REVIEW_2026-10-24.md: "Dropped-attribute counts ... are
+        not wired through the current parser/storage paths." Two
+        unrecognized keys on one span must count as two, bounded by the
+        `scope="span"` label -- never the raw key names."""
+
+        def _count(body: str) -> float:
+            for line in body.splitlines():
+                if line.startswith('obs_dropped_attributes_total{scope="span"}'):
+                    return float(line.rsplit(" ", 1)[1])
+            return 0.0
+
+        before = _count(client.get("/metrics").text)
+        span = _make_span(attributes={"unrecognized.key.one": "x", "unrecognized.key.two": "y"})
+        response = _post(client, _build_request_body([span]))
+        assert response.status_code == 200
+        after = _count(client.get("/metrics").text)
+        assert after == before + 2
+
+    def test_dropped_attributes_total_counts_unrecognized_resource_attributes(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        def _count(body: str) -> float:
+            for line in body.splitlines():
+                if line.startswith('obs_dropped_attributes_total{scope="resource"}'):
+                    return float(line.rsplit(" ", 1)[1])
+            return 0.0
+
+        resource = Resource()
+        kv = resource.attributes.add()
+        kv.key = "unrecognized.resource.key"
+        kv.value.string_value = "x"
+
+        before = _count(client.get("/metrics").text)
+        response = _post(client, _build_request_body([_make_span()], resource=resource))
+        assert response.status_code == 200
+        after = _count(client.get("/metrics").text)
+        assert after == before + 1
+
 
 class TestResolvedScope:
     """R5 (review-evidence/g6-final-2026-10-24): `parse_span` must store
@@ -281,14 +322,14 @@ class TestResolvedScope:
         span = _make_span(
             attributes={"factlama.project_id": "proj-a", "factlama.application_id": "app-a"}
         )
-        parsed = parse_span(
+        parsed, _dropped = parse_span(
             span, resource_attributes={}, tenant=TenantContext(tenant_id="tenant-a")
         )
         assert (parsed.project_id, parsed.application_id) == ("proj-a", "app-a")
 
     def test_a_scoped_credentials_own_scope_is_used_when_no_attribute_is_supplied(self) -> None:
         span = _make_span()
-        parsed = parse_span(
+        parsed, _dropped = parse_span(
             span,
             resource_attributes={},
             tenant=TenantContext(tenant_id="tenant-a", project_id="proj-a"),

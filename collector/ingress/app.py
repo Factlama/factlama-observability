@@ -61,6 +61,18 @@ OTLP_SPANS_TOTAL = Counter(
     registry=_metrics_registry,
 )
 
+# G6_FINAL_REVIEW_2026-10-24.md: "Dropped-attribute counts ... are not
+# wired through the current parser/storage paths." `scope` is bounded to
+# "resource"/"span" -- ADR-021: "counted by bounded reason labels, not raw
+# key/value labels," so the dropped keys' own names are never a label.
+DROPPED_ATTRIBUTES_TOTAL = Counter(
+    "obs_dropped_attributes_total",
+    "Total OTLP attributes dropped during normalization (outside the recognized/"
+    "allowlisted set), by scope (resource or span).",
+    ["scope"],
+    registry=_metrics_registry,
+)
+
 # OBS-04 stage-3 (2026-10-23): bounded request concurrency
 # (LOW_LEVEL_IMPLEMENTATION.md's "Backpressure" rule). A plain module-level
 # object, like the counters above -- tests reach in and swap it directly
@@ -288,12 +300,16 @@ async def receive_otlp_traces(
     rejected_count = 0
     diagnostics: list[str] = []
     for resource, resource_spans in batch.resource_groups:
-        resource_attributes = map_resource_attributes(resource)
+        resource_attributes, resource_dropped = map_resource_attributes(resource)
+        if resource_dropped:
+            DROPPED_ATTRIBUTES_TOTAL.labels(scope="resource").inc(resource_dropped)
         for otlp_span in resource_spans:
             try:
-                normalized = parse_span(
+                normalized, span_dropped = parse_span(
                     otlp_span, resource_attributes=resource_attributes, tenant=tenant
                 )
+                if span_dropped:
+                    DROPPED_ATTRIBUTES_TOTAL.labels(scope="span").inc(span_dropped)
             except SpanParseError as exc:
                 rejected_count += 1
                 diagnostics.append(str(exc))

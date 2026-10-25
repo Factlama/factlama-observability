@@ -44,7 +44,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # database that was never reachable in the first place.
     await check_ready(engine)
     app.state.storage_engine = engine
-    app.state.telemetry_store = PostgresTelemetryStore(engine)
+    app.state.telemetry_store = PostgresTelemetryStore(
+        engine,
+        reconciliation_expired_counter=app.state.reconciliation_expired_total,
+        reconciliation_conflict_counter=app.state.reconciliation_conflict_total,
+    )
     logger.info("storage backend ready")
     try:
         yield

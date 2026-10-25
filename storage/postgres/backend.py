@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from asyncpg import PostgresError  # type: ignore[import-untyped]
+from prometheus_client import Counter
 from sqlalchemy import delete, exists, literal, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
@@ -238,6 +239,8 @@ class PostgresTelemetryStore(TelemetryStore):
         engine: AsyncEngine,
         *,
         reconciliation_window: timedelta = DEFAULT_RECONCILIATION_WINDOW,
+        reconciliation_expired_counter: Counter | None = None,
+        reconciliation_conflict_counter: Counter | None = None,
     ) -> None:
         if not (timedelta(0) < reconciliation_window <= MAX_RECONCILIATION_WINDOW):
             raise ValueError(
@@ -246,6 +249,20 @@ class PostgresTelemetryStore(TelemetryStore):
             )
         self._engine = engine
         self._reconciliation_window = reconciliation_window
+        # G6_FINAL_REVIEW_2026-10-24.md: "once-per-link reconciliation-
+        # expiry/conflict metrics are not wired through the current
+        # parser/storage paths." `None` (the default, used by every
+        # conformance test that does not pass one) simply means metrics
+        # are not recorded -- never affects correlation behavior, same
+        # "best-effort side effect" rule ADR-021 already applies to this
+        # module's other instrumentation. Callers pass the already-built
+        # Counter (from `operations.metrics.install_metrics`), never a bare
+        # registry: this constructor can run many times against the same
+        # registry (`bootstrap.lifespan` re-entering in tests), and a
+        # second `Counter(...)` call on an already-populated registry
+        # raises `DuplicateTimeseries`.
+        self._reconciliation_expired_total = reconciliation_expired_counter
+        self._reconciliation_conflict_total = reconciliation_conflict_counter
 
     async def record_reliability_event(self, event: ReliabilityEvent) -> bool:
         received_at = datetime.now(timezone.utc)
@@ -420,8 +437,12 @@ class PostgresTelemetryStore(TelemetryStore):
             )
         except EvaluationLinkConflict as exc:
             logger.warning("evaluation_link conflict for %r: %s", evaluation_id, exc)
+            if self._reconciliation_conflict_total is not None:
+                self._reconciliation_conflict_total.inc()
             expired = apply_lazy_expiry(existing, now=now)
             if expired.state != existing.state:
+                if self._reconciliation_expired_total is not None:
+                    self._reconciliation_expired_total.inc()
                 await conn.execute(
                     update(evaluation_links)
                     .where(
@@ -432,6 +453,13 @@ class PostgresTelemetryStore(TelemetryStore):
                 )
                 return expired
             return existing
+
+        if (
+            self._reconciliation_expired_total is not None
+            and existing.state != RECONCILIATION_EXPIRED
+            and updated.state == RECONCILIATION_EXPIRED
+        ):
+            self._reconciliation_expired_total.inc()
 
         link_values = _link_to_row(updated)
         del link_values["tenant_id"], link_values["evaluation_id"]
@@ -811,6 +839,8 @@ class PostgresTelemetryStore(TelemetryStore):
                     link = _row_to_link(locked_row)
                     now = datetime.now(timezone.utc)
                     if link.expires_at is not None and now >= link.expires_at:
+                        if self._reconciliation_expired_total is not None:
+                            self._reconciliation_expired_total.inc()
                         await conn.execute(
                             update(evaluation_links)
                             .where(

@@ -74,6 +74,30 @@ def install_metrics(app: FastAPI, *, build_version: str) -> CollectorRegistry:
 
     app.state.record_storage_readiness = record_storage_readiness
 
+    # G6_FINAL_REVIEW_2026-10-24.md: "once-per-link reconciliation-expiry/
+    # conflict metrics are not wired through the current parser/storage
+    # paths." Created here, once per app/registry (not inside
+    # `PostgresTelemetryStore.__init__`, which bootstrap.py's `lifespan`
+    # can re-run many times against the same module-level app in tests --
+    # a second `Counter(...)` call on an already-populated registry raises
+    # `DuplicateTimeseries`). `bootstrap.lifespan` reads these off
+    # `app.state` and hands the Counter objects themselves to the store,
+    # never the registry.
+    app.state.reconciliation_expired_total = Counter(
+        "obs_reconciliation_expired_total",
+        "Evaluation-link PENDING -> RECONCILIATION_EXPIRED transitions, counted exactly "
+        "once per link regardless of how many times it is later read or touched "
+        "(ADR-021's lazy-expiry design).",
+        registry=registry,
+    )
+    app.state.reconciliation_conflict_total = Counter(
+        "obs_reconciliation_conflict_total",
+        "Evaluation-link scope/trace/span conflicts rejected by the correlation side "
+        "effect (ADR-021: the link itself, never the underlying event/span write, which "
+        "always still succeeds).",
+        registry=registry,
+    )
+
     @app.middleware("http")
     async def _record_request_metrics(request: Request, call_next: RequestHandler) -> Response:
         start = monotonic()
