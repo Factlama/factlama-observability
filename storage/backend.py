@@ -174,6 +174,21 @@ class TelemetryStore(Protocol):
         failure, same as every other method here."""
         ...
 
+    async def get_span_mapping_profile(
+        self, tenant_id: str, trace_id: str, span_id: str
+    ) -> tuple[str, str] | None:
+        """F2 (review-evidence/g6-coverage-fix-review-2026-10-25): the
+        `(mapping_version, semconv_version)` an already-stored span of
+        this exact identity was normalized under, or `None` if no span
+        with this identity is stored yet. The ingress route calls this
+        *before* normalizing an incoming span, so a replay of an
+        existing identity re-normalizes under its own stored profile
+        (ADR-021 paragraph 65) instead of whatever is currently active.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
     async def get_trace(self, tenant: TenantContext, trace_id: str) -> AITrace | None:
         """OBS-07's trace-detail read (ADR-021): the tenant/project/
         application-scoped `AITrace` projection for `trace_id` -- its

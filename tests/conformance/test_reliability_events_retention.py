@@ -322,3 +322,73 @@ async def test_a_caller_before_cutoff_cannot_shorten_the_replay_horizon(
     )
     assert deleted == 1  # the source event is still deleted...
     assert await _link_exists(engine, "tenant-a", "eval-1")  # ...but the marker is not
+
+
+async def test_replay_after_marker_deletion_does_not_revive_the_link(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """F1 (review-evidence/g6-coverage-fix-review-2026-10-25): the
+    bounded deletion floor on the full marker row is not itself a replay
+    admission boundary -- once the marker is actually deleted, a replay
+    of the identical identity must still not revive it. The tombstone in
+    `retired_evaluations` is what enforces this, independent of whether
+    the full marker row still exists."""
+    span = make_span(evaluation_id="eval-1", trace_id="0123456789abcdef0123456789abcdef")
+    event = make_event(evaluation_id="eval-1", trace_id=span.trace_id, span_id=span.span_id)
+    await store.record_reliability_event(event)
+
+    old = datetime.now(timezone.utc) - timedelta(days=6)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(evaluation_links).values(
+                state="RECONCILIATION_EXPIRED",
+                first_received_at=old,
+                expires_at=old + timedelta(hours=24),
+            )
+        )
+        await conn.execute(update(reliability_events).values(received_at=old))
+
+    deleted = await store.delete_reliability_events(
+        "tenant-a", before=datetime.now(timezone.utc) + timedelta(seconds=1)
+    )
+    assert deleted == 1
+    assert not await _link_exists(engine, "tenant-a", "eval-1")
+
+    # Replaying the identical event plus its matching span must not
+    # revive the correlation now that the full marker row is gone.
+    await store.record_reliability_event(event)
+    await store.record_normalized_span(span)
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value != "AVAILABLE"
+
+
+async def test_a_retired_identity_blocks_a_fresh_span_only_touch(
+    store: PostgresTelemetryStore, engine: AsyncEngine
+) -> None:
+    """The tombstone check must apply to the span side of a touch too,
+    not only the event side -- a span-first replay of a retired identity
+    must not create a fresh link either."""
+    event = make_event(evaluation_id="eval-1")
+    await store.record_reliability_event(event)
+
+    old = datetime.now(timezone.utc) - timedelta(days=6)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(evaluation_links).values(
+                state="RECONCILIATION_EXPIRED",
+                first_received_at=old,
+                expires_at=old + timedelta(hours=24),
+            )
+        )
+        await conn.execute(update(reliability_events).values(received_at=old))
+
+    await store.delete_reliability_events(
+        "tenant-a", before=datetime.now(timezone.utc) + timedelta(seconds=1)
+    )
+    assert not await _link_exists(engine, "tenant-a", "eval-1")
+
+    span = make_span(evaluation_id="eval-1")
+    await store.record_normalized_span(span)
+    assert not await _link_exists(engine, "tenant-a", "eval-1")

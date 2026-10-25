@@ -37,8 +37,16 @@ SPAN_ID = "0123456789abcdef"
 
 class FakeTelemetryStore:
     def __init__(self) -> None:
-        self._spans: dict[tuple[str, str, str], str] = {}
+        self._spans: dict[tuple[str, str, str], NormalizedSpan] = {}
         self.fail_next = False
+
+    async def get_span_mapping_profile(
+        self, tenant_id: str, trace_id: str, span_id: str
+    ) -> tuple[str, str] | None:
+        stored = self._spans.get((tenant_id, trace_id, span_id))
+        if stored is None:
+            return None
+        return stored.mapping_version, stored.semconv_version
 
     async def record_normalized_span(self, span: NormalizedSpan) -> SpanRecordOutcome:
         if self.fail_next:
@@ -47,9 +55,9 @@ class FakeTelemetryStore:
         key = (span.tenant_id, span.trace_id, span.span_id)
         content_hash = span.canonical_content_hash()
         if key not in self._spans:
-            self._spans[key] = content_hash
+            self._spans[key] = span
             return SpanRecordOutcome.ACCEPTED
-        if self._spans[key] == content_hash:
+        if self._spans[key].canonical_content_hash() == content_hash:
             return SpanRecordOutcome.DUPLICATE
         return SpanRecordOutcome.CONFLICT
 
@@ -361,6 +369,51 @@ class TestMetrics:
         assert response.status_code == 200
         after = _count(client.get("/metrics").text)
         assert after == before + 1
+
+
+class TestMappingProfileReplay:
+    """F2 (review-evidence/g6-coverage-fix-review-2026-10-25): the real
+    HTTP path for ADR-021 paragraph 65's "select the stored profile
+    before applying transformations" -- the route's own lookup
+    (`FakeTelemetryStore.get_span_mapping_profile`) must find the stored
+    identity and select its real profile automatically, with no signal
+    in the request itself marking this as a replay."""
+
+    def test_replay_survives_a_mapping_upgrade_through_the_real_route(
+        self, client: TestClient, store: FakeTelemetryStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dataclasses import replace
+
+        from collector.ingress import otlp as otlp_module
+        from collector.processing import otlp_attribute_mapping
+
+        wire = _make_span(attributes={"gen_ai.provider.name": "provider-a"})
+        first = _post(client, _build_request_body([wire]))
+        assert first.status_code == 200
+        assert len(store._spans) == 1
+
+        # A deployment changing the active mapper to something that
+        # genuinely behaves differently for the same wire content.
+        v1_mapper = otlp_attribute_mapping.map_span_attributes
+
+        def v2_mapper(attrs: object) -> otlp_attribute_mapping.MappedSpanAttributes:
+            return replace(v1_mapper(attrs), provider_id="canonical-provider")  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            otlp_attribute_mapping,
+            "_MAPPING_PROFILES",
+            {**otlp_attribute_mapping._MAPPING_PROFILES, "factlama-genai-2": v2_mapper},
+        )
+        monkeypatch.setattr(otlp_attribute_mapping, "MAPPING_VERSION", "factlama-genai-2")
+        monkeypatch.setattr(otlp_module, "MAPPING_VERSION", "factlama-genai-2")
+        monkeypatch.setattr(otlp_module, "map_span_attributes", v2_mapper)
+
+        second = _post(client, _build_request_body([wire]))
+        parsed = _parse_response(second)
+        assert parsed.partial_success.rejected_spans == 0  # duplicate, not rejected/conflicted
+        assert len(store._spans) == 1
+        stored_span = next(iter(store._spans.values()))
+        assert stored_span.provider_id == "provider-a"  # the original (v1) content, untouched
 
 
 class TestResolvedScope:

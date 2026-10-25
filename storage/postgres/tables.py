@@ -126,3 +126,26 @@ evaluation_links = Table(
     Index("ix_evaluation_links_tenant_trace", "tenant_id", "trace_id"),
     Index("ix_evaluation_links_tenant_interaction", "tenant_id", "interaction_id"),
 )
+
+retired_evaluations = Table(
+    "retired_evaluations",
+    metadata,
+    # F1 (review-evidence/g6-coverage-fix-review-2026-10-25): a bounded
+    # *deletion* floor on the full `evaluation_links` row (above) is not
+    # itself a replay admission boundary -- once that row is actually
+    # gone, nothing stopped a replay of the same identity from creating
+    # a brand-new PENDING link and completing normally, reviving a
+    # correlation ADR-021 requires to stay permanently expired. This is
+    # the "durable mechanism to reject retired identities" the review
+    # names as the alternative to retaining the full marker forever: a
+    # minimal (tenant_id, evaluation_id, retired_at) tombstone, written
+    # the moment `delete_reliability_events` is about to remove a
+    # RECONCILIATION_EXPIRED marker, and never deleted itself -- its
+    # footprint (one identity pair plus a timestamp, no trace/span/scope
+    # content) is negligible compared to the full row it replaces, so
+    # retaining it permanently does not reopen the storage-growth problem
+    # bounding the full marker's own retention was meant to solve.
+    Column("tenant_id", String(128), primary_key=True),
+    Column("evaluation_id", String(128), primary_key=True),
+    Column("retired_at", DateTime(timezone=True), nullable=False),
+)

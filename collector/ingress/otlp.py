@@ -24,6 +24,7 @@ from collector.processing.otlp_attribute_mapping import (
     SEMCONV_VERSION,
     AttributeMappingConflict,
     check_scope_agreement,
+    get_mapping_profile,
     map_span_attributes,
 )
 from schemas.normalized_span import NormalizedSpan, SpanStatus
@@ -104,13 +105,43 @@ def _nanos_to_iso(nanos: int) -> str:
 
 
 def parse_span(
-    otlp_span: OtlpSpan, *, resource_attributes: dict[str, str], tenant: TenantContext
+    otlp_span: OtlpSpan,
+    *,
+    resource_attributes: dict[str, str],
+    tenant: TenantContext,
+    mapping_profile_override: tuple[str, str] | None = None,
 ) -> tuple[NormalizedSpan, int]:
     """Raises `SpanParseError` for any structural or mapping problem with
     this one span. Returns the normalized span plus how many of its own
     attribute keys were dropped (outside `RECOGNIZED_ATTRIBUTE_KEYS`) --
     see `map_resource_attributes`'s docstring for why this is a count, not
-    the raw key names."""
+    the raw key names.
+
+    F2 (review-evidence/g6-coverage-fix-review-2026-10-25): ADR-021
+    paragraph 65 -- a replay of an already-stored identity must be
+    normalized using *that identity's own* mapping profile, not whatever
+    is currently active, so a mapping-version bump never turns an
+    otherwise byte-identical replay into a false content conflict.
+    `mapping_profile_override=(mapping_version, semconv_version)` is the
+    caller's own prior lookup of the stored identity's profile (collector/
+    ingress/app.py queries storage for it before calling this); `None`
+    (fresh ingestion, no prior identity) uses whatever is currently
+    active. Raises `SpanParseError` if the stored version is no longer a
+    registered profile at all -- never falls back to relabeling the
+    active mapper's own output, which cannot reproduce a transformation
+    that has since changed."""
+    if mapping_profile_override is not None:
+        mapping_version, semconv_version = mapping_profile_override
+        mapper = get_mapping_profile(mapping_version)
+        if mapper is None:
+            raise SpanParseError(
+                f"stored mapping profile {mapping_version!r} is no longer supported; "
+                "cannot normalize this replay"
+            )
+    else:
+        mapping_version, semconv_version = MAPPING_VERSION, SEMCONV_VERSION
+        mapper = map_span_attributes
+
     try:
         scope = check_scope_agreement(
             otlp_span.attributes,
@@ -118,7 +149,7 @@ def parse_span(
             authorized_project_id=tenant.project_id,
             authorized_application_id=tenant.application_id,
         )
-        mapped = map_span_attributes(otlp_span.attributes)
+        mapped = mapper(otlp_span.attributes)
     except AttributeMappingConflict as exc:
         # R6 (review-evidence/g6-final-2026-10-24): `exc`'s own message is
         # already bounded/content-free (fixed at the source in
@@ -140,8 +171,8 @@ def parse_span(
 
     try:
         normalized = NormalizedSpan(
-            mapping_version=MAPPING_VERSION,
-            semconv_version=SEMCONV_VERSION,
+            mapping_version=mapping_version,
+            semconv_version=semconv_version,
             tenant_id=tenant.tenant_id,
             # R5 (review-evidence/g6-final-2026-10-24): the resolved scope
             # (the credential's own narrower scope, else a validated

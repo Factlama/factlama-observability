@@ -72,21 +72,15 @@ from storage.correlation import (
     touch_link,
 )
 from storage.errors import StorageUnavailableError
-from storage.postgres.tables import evaluation_links, reliability_events, spans
+from storage.postgres.tables import (
+    evaluation_links,
+    reliability_events,
+    retired_evaluations,
+    spans,
+)
 from storage.spans import SpanRecordOutcome
 
 logger = logging.getLogger(__name__)
-
-_SUPPORTED_MAPPING_VERSIONS = frozenset({"factlama-genai-1"})
-"""R4 (review-evidence/g6-coverage-review-2026-10-25): the set of mapping
-versions this process can still normalize a replay under -- a deliberate
-literal duplicate of `collector/processing/otlp_attribute_mapping.py::
-MAPPING_VERSION`, not an import of it: `storage` must not depend on
-`collector` (`pyproject.toml`'s import-linter contract), the same reason
-`tests/conformance/conftest.py::make_span` already hardcodes this exact
-string rather than importing the constant. Extend this set the day a
-second mapping algorithm is actually introduced; until then there is
-only ever one to recognize."""
 
 DEFAULT_RECONCILIATION_WINDOW = timedelta(hours=24)
 """ADR-021: "Default 24 hours, configurable within (0, 72 hours]." """
@@ -311,6 +305,11 @@ class PostgresTelemetryStore(TelemetryStore):
             .on_conflict_do_nothing(index_elements=["tenant_id", "event_id"])
             .returning(reliability_events.c.event_id)
         )
+        # F4 (review-evidence/g6-coverage-fix-review-2026-10-25): accumulated
+        # across every `_touch_evaluation_link` call in this one transaction,
+        # applied only after it commits -- see that method's own docstring.
+        expired_delta_total = 0
+        conflict_delta_total = 0
         try:
             async with self._engine.begin() as conn:
                 inserted = (await conn.execute(stmt)).first()
@@ -320,7 +319,7 @@ class PostgresTelemetryStore(TelemetryStore):
                     # link, from either arrival order. Only a *new* insert
                     # touches it -- a replay of an already-stored event
                     # must not re-advance correlation state a second time.
-                    link = await self._touch_evaluation_link(
+                    link, expired_delta, conflict_delta = await self._touch_evaluation_link(
                         conn,
                         tenant_id=event.tenant_id,
                         evaluation_id=event.evaluation_id,
@@ -332,6 +331,8 @@ class PostgresTelemetryStore(TelemetryStore):
                         source="event",
                         now=received_at,
                     )
+                    expired_delta_total += expired_delta
+                    conflict_delta_total += conflict_delta
 
                     # G6_FINAL_REVIEW_2026-10-24.md: "Interaction-only
                     # unique/ambiguous matching ... [is] not established by
@@ -387,7 +388,7 @@ class PostgresTelemetryStore(TelemetryStore):
                             # requires picking exactly *one* span, which a
                             # trace-level match (ADR-021: "using trace_id
                             # alone") was never supposed to need.
-                            link = await self._touch_evaluation_link(
+                            link, expired_delta, conflict_delta = await self._touch_evaluation_link(
                                 conn,
                                 tenant_id=event.tenant_id,
                                 evaluation_id=event.evaluation_id,
@@ -399,6 +400,8 @@ class PostgresTelemetryStore(TelemetryStore):
                                 source="span",
                                 now=received_at,
                             )
+                            expired_delta_total += expired_delta
+                            conflict_delta_total += conflict_delta
                             resolved_trace_id = resolved
 
                     # R3/F2 (review-evidence/g6-final-2026-10-24 and
@@ -438,7 +441,7 @@ class PostgresTelemetryStore(TelemetryStore):
                             # (not the event's) keeps this consistent with
                             # what the span's own native touch would have
                             # supplied.
-                            await self._touch_evaluation_link(
+                            _, expired_delta, conflict_delta = await self._touch_evaluation_link(
                                 conn,
                                 tenant_id=event.tenant_id,
                                 evaluation_id=event.evaluation_id,
@@ -450,10 +453,17 @@ class PostgresTelemetryStore(TelemetryStore):
                                 source="span",
                                 now=received_at,
                             )
+                            expired_delta_total += expired_delta
+                            conflict_delta_total += conflict_delta
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not record reliability event {event.event_id!r}: {exc}"
             ) from exc
+        # Only reached once the transaction above has actually committed.
+        if self._reconciliation_expired_total is not None and expired_delta_total:
+            self._reconciliation_expired_total.inc(expired_delta_total)
+        if self._reconciliation_conflict_total is not None and conflict_delta_total:
+            self._reconciliation_conflict_total.inc(conflict_delta_total)
         return inserted is not None
 
     async def _touch_evaluation_link(
@@ -469,16 +479,26 @@ class PostgresTelemetryStore(TelemetryStore):
         interaction_id: str | None,
         source: str,
         now: datetime,
-    ) -> EvaluationLinkRow | None:
+    ) -> tuple[EvaluationLinkRow | None, int, int]:
         """Best-effort correlation side effect (ADR-021): never raises,
         and never affects whether the caller's own event/span insert
         succeeds -- a scope/reference conflict here is logged and the
         touch is dropped, except for a lazy-expiry flip, which is always
-        persisted even then. Returns the link's resulting row (its
-        established scope is what a caller doing trace-level matching
-        afterwards must filter candidates by -- never the touch's own
-        possibly-incompatible input), or `None` only in the pathological
-        case noted below.
+        persisted even then. Returns `(link, expired_delta, conflict_delta)`
+        -- the link row (its established scope is what a caller doing
+        trace-level matching afterwards must filter candidates by -- never
+        the touch's own possibly-incompatible input), or `None` only in
+        the pathological case noted below, plus how many expiry/conflict
+        transitions this one call made.
+
+        F4 (review-evidence/g6-coverage-fix-review-2026-10-25): this
+        deliberately does *not* increment the metrics itself -- this
+        method runs inside the caller's own open transaction, which a
+        later statement in that same transaction can still roll back.
+        Incrementing a process-wide Prometheus counter cannot be rolled
+        back with it, so every caller must accumulate these deltas and
+        apply them only after its own `async with ... begin()` block has
+        exited successfully (i.e. after a real commit).
 
         R1 (review-evidence/g6-final-2026-10-24): a bare SELECT-then-
         INSERT/UPDATE previously let a concurrent first arrival's own
@@ -494,7 +514,26 @@ class PostgresTelemetryStore(TelemetryStore):
         locks it before merging, serializing against any other
         concurrent toucher of the same identity for the rest of this
         transaction, so no update here is ever lost to another one
-        in flight."""
+        in flight.
+
+        F1 (review-evidence/g6-coverage-fix-review-2026-10-25): checked
+        before anything else -- a retired identity (its full marker row
+        already deleted, but its tombstone still present) must never get
+        a fresh `PENDING` link at all. This is what actually enforces
+        the replay boundary; the deletion floor on the full marker row
+        only ever governed when that row becomes eligible for removal,
+        never whether the identity could be revived afterward."""
+        retired = (
+            await conn.execute(
+                select(1).where(
+                    retired_evaluations.c.tenant_id == tenant_id,
+                    retired_evaluations.c.evaluation_id == evaluation_id,
+                )
+            )
+        ).first()
+        if retired is not None:
+            return None, 0, 0
+
         link = new_link(
             tenant_id=tenant_id,
             evaluation_id=evaluation_id,
@@ -516,7 +555,7 @@ class PostgresTelemetryStore(TelemetryStore):
             )
         ).first()
         if inserted is not None:
-            return link  # this transaction created the row fresh; nothing more to merge
+            return link, 0, 0  # this transaction created the row fresh; nothing more to merge
 
         existing_row = (
             await conn.execute(
@@ -534,7 +573,7 @@ class PostgresTelemetryStore(TelemetryStore):
             # only way here, which `delete_reliability_events` never
             # does within an overlapping window (it only ever removes a
             # fully-orphaned marker, never one a touch just created).
-            return None
+            return None, 0, 0
 
         existing = _row_to_link(existing_row)
         try:
@@ -550,12 +589,8 @@ class PostgresTelemetryStore(TelemetryStore):
             )
         except EvaluationLinkConflict as exc:
             logger.warning("evaluation_link conflict for %r: %s", evaluation_id, exc)
-            if self._reconciliation_conflict_total is not None:
-                self._reconciliation_conflict_total.inc()
             expired = apply_lazy_expiry(existing, now=now)
             if expired.state != existing.state:
-                if self._reconciliation_expired_total is not None:
-                    self._reconciliation_expired_total.inc()
                 await conn.execute(
                     update(evaluation_links)
                     .where(
@@ -564,15 +599,14 @@ class PostgresTelemetryStore(TelemetryStore):
                     )
                     .values(state=expired.state)
                 )
-                return expired
-            return existing
+                return expired, 1, 1
+            return existing, 0, 1
 
-        if (
-            self._reconciliation_expired_total is not None
-            and existing.state != RECONCILIATION_EXPIRED
-            and updated.state == RECONCILIATION_EXPIRED
-        ):
-            self._reconciliation_expired_total.inc()
+        expired_delta = (
+            1
+            if existing.state != RECONCILIATION_EXPIRED and updated.state == RECONCILIATION_EXPIRED
+            else 0
+        )
 
         link_values = _link_to_row(updated)
         del link_values["tenant_id"], link_values["evaluation_id"]
@@ -584,7 +618,7 @@ class PostgresTelemetryStore(TelemetryStore):
             )
             .values(**link_values)
         )
-        return updated
+        return updated, expired_delta, 0
 
     async def get_reliability_event(
         self, tenant: TenantContext, evaluation_id: str
@@ -731,20 +765,7 @@ class PostgresTelemetryStore(TelemetryStore):
         # clock, not `before` itself, so this floor cannot be bypassed by
         # simply choosing a far-future cutoff.
         replay_eligible_before = datetime.now(timezone.utc) - self._replay_horizon
-        link_clauses: list[ColumnElement[bool]] = [
-            evaluation_links.c.tenant_id == tenant_id,
-            or_(
-                and_(
-                    evaluation_links.c.state != RECONCILIATION_EXPIRED,
-                    evaluation_links.c.first_received_at < before,
-                ),
-                and_(
-                    evaluation_links.c.state == RECONCILIATION_EXPIRED,
-                    evaluation_links.c.expires_at.isnot(None),
-                    evaluation_links.c.expires_at < before,
-                    evaluation_links.c.expires_at < replay_eligible_before,
-                ),
-            ),
+        no_source_remains = [
             ~exists(
                 select(1).where(
                     reliability_events.c.tenant_id == evaluation_links.c.tenant_id,
@@ -759,14 +780,43 @@ class PostgresTelemetryStore(TelemetryStore):
                 )
             ),
         ]
+        # F1 (review-evidence/g6-coverage-fix-review-2026-10-25): isolated
+        # from the non-expired branch below so a tombstone (see
+        # `retired_evaluations`) can be written for exactly this set,
+        # and only this set, right before it is deleted.
+        expired_and_eligible = and_(
+            evaluation_links.c.state == RECONCILIATION_EXPIRED,
+            evaluation_links.c.expires_at.isnot(None),
+            evaluation_links.c.expires_at < before,
+            evaluation_links.c.expires_at < replay_eligible_before,
+            *no_source_remains,
+        )
+        link_clauses: list[ColumnElement[bool]] = [
+            evaluation_links.c.tenant_id == tenant_id,
+            or_(
+                and_(
+                    evaluation_links.c.state != RECONCILIATION_EXPIRED,
+                    evaluation_links.c.first_received_at < before,
+                    *no_source_remains,
+                ),
+                expired_and_eligible,
+            ),
+        ]
+        expired_marker_clauses: list[ColumnElement[bool]] = [
+            evaluation_links.c.tenant_id == tenant_id,
+            expired_and_eligible,
+        ]
         if project_id is not None:
             event_clauses.append(reliability_events.c.project_id == project_id)
             span_clauses.append(spans.c.project_id == project_id)
             link_clauses.append(evaluation_links.c.project_id == project_id)
+            expired_marker_clauses.append(evaluation_links.c.project_id == project_id)
         if application_id is not None:
             event_clauses.append(reliability_events.c.application_id == application_id)
             span_clauses.append(spans.c.application_id == application_id)
             link_clauses.append(evaluation_links.c.application_id == application_id)
+            expired_marker_clauses.append(evaluation_links.c.application_id == application_id)
+        expired_rowcount = 0
         try:
             async with self._engine.begin() as conn:
                 # Normalize state first: a link past its deadline that
@@ -785,27 +835,53 @@ class PostgresTelemetryStore(TelemetryStore):
                     )
                     .values(state=RECONCILIATION_EXPIRED)
                 )
-                # R3 (review-evidence/g6-coverage-review-2026-10-25): this
-                # bulk transition is a real PENDING -> RECONCILIATION_EXPIRED
-                # flip like any other -- it must count toward
-                # obs_reconciliation_expired_total exactly like the
-                # touch/read-driven transitions already do, not bypass it.
-                # `rowcount` is exactly the set of rows this statement's own
-                # WHERE clause actually matched (state == PENDING), so this
-                # can never double-count a row already expired by an
-                # earlier call or touch.
-                if self._reconciliation_expired_total is not None and expiry_result.rowcount:
-                    self._reconciliation_expired_total.inc(expiry_result.rowcount)
+                # F4 (review-evidence/g6-coverage-fix-review-2026-10-25):
+                # the rowcount is captured here, but the counter itself
+                # must not be incremented until this transaction actually
+                # commits -- a later statement in this same transaction
+                # (the deletes below) can still fail and roll back this
+                # UPDATE along with everything else. Incrementing a
+                # process-wide Prometheus counter cannot be rolled back
+                # with it, so doing it here would overcount on any later
+                # failure, including one a retry of this same call would
+                # then double-count again.
+                expired_rowcount = expiry_result.rowcount
                 event_result = await conn.execute(delete(reliability_events).where(*event_clauses))
                 await conn.execute(delete(spans).where(*span_clauses))
+                # F1 (review-evidence/g6-coverage-fix-review-2026-10-25):
+                # write a permanent tombstone for exactly the identities
+                # about to lose their full marker row below -- this, not
+                # the deletion floor itself, is what actually blocks a
+                # later replay of the same identity from reviving it.
+                # `ON CONFLICT DO NOTHING`: idempotent against a retry of
+                # this same call, or a second call racing on the same
+                # identity.
+                await conn.execute(
+                    pg_insert(retired_evaluations)
+                    .from_select(
+                        ["tenant_id", "evaluation_id", "retired_at"],
+                        select(
+                            evaluation_links.c.tenant_id,
+                            evaluation_links.c.evaluation_id,
+                            literal(datetime.now(timezone.utc)),
+                        ).where(*expired_marker_clauses),
+                    )
+                    .on_conflict_do_nothing(index_elements=["tenant_id", "evaluation_id"])
+                )
                 # The marker goes last: by the time this runs, the source
                 # rows it could still be protecting have already been
-                # removed above within this same transaction.
+                # removed above within this same transaction, and its
+                # tombstone (if it was in RECONCILIATION_EXPIRED state) is
+                # already written.
                 await conn.execute(delete(evaluation_links).where(*link_clauses))
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not delete reliability events for tenant {tenant_id!r}: {exc}"
             ) from exc
+        # Only reached once `async with self._engine.begin()` has exited
+        # without raising -- i.e. after a successful commit.
+        if self._reconciliation_expired_total is not None and expired_rowcount:
+            self._reconciliation_expired_total.inc(expired_rowcount)
         return event_result.rowcount
 
     async def record_normalized_span(self, span: NormalizedSpan) -> SpanRecordOutcome:
@@ -817,6 +893,11 @@ class PostgresTelemetryStore(TelemetryStore):
             .on_conflict_do_nothing(index_elements=["tenant_id", "trace_id", "span_id"])
             .returning(spans.c.content_hash)
         )
+        # F4 (review-evidence/g6-coverage-fix-review-2026-10-25): see
+        # _touch_evaluation_link's own docstring -- applied only after the
+        # transaction below commits.
+        expired_delta_total = 0
+        conflict_delta_total = 0
         try:
             async with self._engine.begin() as conn:
                 inserted = (await conn.execute(insert_stmt)).first()
@@ -825,11 +906,7 @@ class PostgresTelemetryStore(TelemetryStore):
                 else:
                     existing = (
                         await conn.execute(
-                            select(
-                                spans.c.content_hash,
-                                spans.c.mapping_version,
-                                spans.c.semconv_version,
-                            ).where(
+                            select(spans.c.content_hash).where(
                                 spans.c.tenant_id == span.tenant_id,
                                 spans.c.trace_id == span.trace_id,
                                 spans.c.span_id == span.span_id,
@@ -841,53 +918,27 @@ class PostgresTelemetryStore(TelemetryStore):
                     # no-op success; a different hash under the same
                     # identity is CONFLICT, rejected without modifying
                     # the stored span.
-                    if existing is not None and existing.content_hash == content_hash:
-                        outcome = SpanRecordOutcome.DUPLICATE
-                    elif existing is None:
-                        outcome = SpanRecordOutcome.CONFLICT  # pragma: no cover
-                    elif existing.mapping_version not in _SUPPORTED_MAPPING_VERSIONS:
-                        # R4 (review-evidence/g6-coverage-review-2026-10-25),
-                        # ADR-021 paragraph 65: "If [the stored mapping
-                        # profile] is unavailable, reject explicitly rather
-                        # than silently overwrite or compare incompatible
-                        # normalizations." A mapping version this process
-                        # no longer recognizes at all cannot be replayed
-                        # under -- comparing anyway (either direction) would
-                        # be exactly the silent, incompatible comparison
-                        # ADR-021 forbids.
-                        outcome = SpanRecordOutcome.CONFLICT
-                    else:
-                        # R4: a mapping-version/semconv-version bump between
-                        # the original ingest and this replay must not, on
-                        # its own, make an otherwise byte-identical replay
-                        # look like a content conflict -- "replays of
-                        # existing identities must be normalized using the
-                        # stored mapping profile." The ingress route
-                        # (collector/ingress/otlp.py::parse_span) always
-                        # normalizes with whatever mapping is currently
-                        # active; this re-attributes the incoming span to
-                        # the *stored* identity's own mapping/semconv
-                        # version before re-hashing, the only operation
-                        # "using the stored profile" can mean while a
-                        # single mapping algorithm (map_span_attributes)
-                        # has ever existed in this codebase -- a stored
-                        # version this process still recognizes (checked
-                        # above) has, by construction, never had a
-                        # different transformation registered for it.
-                        reattributed_hash = span.model_copy(
-                            update={
-                                "mapping_version": existing.mapping_version,
-                                "semconv_version": existing.semconv_version,
-                            }
-                        ).canonical_content_hash()
-                        outcome = (
-                            SpanRecordOutcome.DUPLICATE
-                            if reattributed_hash == existing.content_hash
-                            else SpanRecordOutcome.CONFLICT
-                        )
+                    #
+                    # F2 (review-evidence/g6-coverage-fix-review-2026-10-25):
+                    # this is a plain hash comparison, deliberately not a
+                    # mapping-version-aware one -- re-normalizing under the
+                    # *stored* identity's own profile (ADR-021 paragraph 65)
+                    # happens upstream, in collector/ingress/otlp.py::parse_span,
+                    # which has the raw OTLP attributes this layer does not.
+                    # By the time a span reaches here, it has already been
+                    # normalized under the correct profile if one was stored
+                    # for this identity (collector/ingress/app.py looks it up
+                    # before calling parse_span); a hash mismatch at this
+                    # point is a genuine content difference, not a mapping-
+                    # version artifact this layer could silently paper over.
+                    outcome = (
+                        SpanRecordOutcome.DUPLICATE
+                        if existing is not None and existing.content_hash == content_hash
+                        else SpanRecordOutcome.CONFLICT
+                    )
                 if outcome != SpanRecordOutcome.CONFLICT:
                     if span.evaluation_id is not None:
-                        await self._touch_evaluation_link(
+                        _, expired_delta, conflict_delta = await self._touch_evaluation_link(
                             conn,
                             tenant_id=span.tenant_id,
                             evaluation_id=span.evaluation_id,
@@ -899,6 +950,8 @@ class PostgresTelemetryStore(TelemetryStore):
                             source="span",
                             now=received_at,
                         )
+                        expired_delta_total += expired_delta
+                        conflict_delta_total += conflict_delta
                     # R3/F2 (review-evidence/g6-final-2026-10-24 and
                     # g6-fix-followup-2026-10-24): a span carrying no
                     # evaluation_id back-reference at all can still be
@@ -935,7 +988,7 @@ class PostgresTelemetryStore(TelemetryStore):
                         ],
                     )
                     if matched_link is not None:
-                        await self._touch_evaluation_link(
+                        _, expired_delta, conflict_delta = await self._touch_evaluation_link(
                             conn,
                             tenant_id=span.tenant_id,
                             evaluation_id=matched_link.evaluation_id,
@@ -947,6 +1000,8 @@ class PostgresTelemetryStore(TelemetryStore):
                             source="span",
                             now=received_at,
                         )
+                        expired_delta_total += expired_delta
+                        conflict_delta_total += conflict_delta
 
                     # G6_FINAL_REVIEW_2026-10-24.md: the reverse of the
                     # interaction-only resolution `record_reliability_event`
@@ -998,7 +1053,11 @@ class PostgresTelemetryStore(TelemetryStore):
                                     candidates=interaction_candidates,
                                 )
                                 if resolved is not None:
-                                    await self._touch_evaluation_link(
+                                    (
+                                        _,
+                                        expired_delta,
+                                        conflict_delta,
+                                    ) = await self._touch_evaluation_link(
                                         conn,
                                         tenant_id=span.tenant_id,
                                         evaluation_id=pending_link_row.evaluation_id,
@@ -1010,13 +1069,46 @@ class PostgresTelemetryStore(TelemetryStore):
                                         source="span",
                                         now=received_at,
                                     )
+                                    expired_delta_total += expired_delta
+                                    conflict_delta_total += conflict_delta
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(
                 f"could not record span {span.span_id!r} for trace {span.trace_id!r}: {exc}"
             ) from exc
+        # Only reached once the transaction above has actually committed.
+        if self._reconciliation_expired_total is not None and expired_delta_total:
+            self._reconciliation_expired_total.inc(expired_delta_total)
+        if self._reconciliation_conflict_total is not None and conflict_delta_total:
+            self._reconciliation_conflict_total.inc(conflict_delta_total)
         return outcome
 
+    async def get_span_mapping_profile(
+        self, tenant_id: str, trace_id: str, span_id: str
+    ) -> tuple[str, str] | None:
+        try:
+            async with self._engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        select(spans.c.mapping_version, spans.c.semconv_version).where(
+                            spans.c.tenant_id == tenant_id,
+                            spans.c.trace_id == trace_id,
+                            spans.c.span_id == span_id,
+                        )
+                    )
+                ).first()
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(
+                f"could not read mapping profile for span {span_id!r}: {exc}"
+            ) from exc
+        if row is None:
+            return None
+        return row.mapping_version, row.semconv_version
+
     async def get_trace(self, tenant: TenantContext, trace_id: str) -> AITrace | None:
+        # F4 (review-evidence/g6-coverage-fix-review-2026-10-25): applied
+        # only after the transaction below commits -- see
+        # _touch_evaluation_link's docstring for why.
+        expired_delta_total = 0
         try:
             async with self._engine.begin() as conn:
                 span_rows = (
@@ -1093,8 +1185,7 @@ class PostgresTelemetryStore(TelemetryStore):
                         pending_link = _row_to_link(locked_pending_row)
                         now = datetime.now(timezone.utc)
                         if pending_link.expires_at is not None and now >= pending_link.expires_at:
-                            if self._reconciliation_expired_total is not None:
-                                self._reconciliation_expired_total.inc()
+                            expired_delta_total += 1
                             await conn.execute(
                                 update(evaluation_links)
                                 .where(
@@ -1211,8 +1302,7 @@ class PostgresTelemetryStore(TelemetryStore):
                     link = _row_to_link(locked_row)
                     now = datetime.now(timezone.utc)
                     if link.expires_at is not None and now >= link.expires_at:
-                        if self._reconciliation_expired_total is not None:
-                            self._reconciliation_expired_total.inc()
+                        expired_delta_total += 1
                         await conn.execute(
                             update(evaluation_links)
                             .where(
@@ -1266,6 +1356,9 @@ class PostgresTelemetryStore(TelemetryStore):
                     links.append(updated)
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(f"could not read trace {trace_id!r}: {exc}") from exc
+        # Only reached once the transaction above has actually committed.
+        if self._reconciliation_expired_total is not None and expired_delta_total:
+            self._reconciliation_expired_total.inc(expired_delta_total)
 
         # Authorization (docs/storage-query.md: "Queries must not expose
         # existence across tenants"): a span/link outside tenant's

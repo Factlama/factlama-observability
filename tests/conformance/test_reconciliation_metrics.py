@@ -10,12 +10,17 @@ machine; this proves the storage layer's own instrumentation around it.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
+import pytest
 from prometheus_client import CollectorRegistry, Counter, generate_latest
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from schemas.tenancy import TenantContext
+from storage.errors import StorageUnavailableError
 from storage.postgres.backend import PostgresTelemetryStore
+from storage.postgres.tables import evaluation_links
 from tests.conformance.conftest import make_event, make_span
 
 TENANT_A = TenantContext(tenant_id="tenant-a")
@@ -146,3 +151,35 @@ async def test_retention_triggered_expiry_increments_the_expired_counter(
     await metered_store.delete_reliability_events("tenant-a", before=datetime.now(timezone.utc))
 
     assert _count(registry, "test_reconciliation_expired_total") == 1.0
+
+
+async def test_a_rolled_back_retention_transaction_does_not_count_expiry(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4 (review-evidence/g6-coverage-fix-review-2026-10-25):
+    `delete_reliability_events` captures the expiry UPDATE's rowcount
+    inside its one transaction, but a later statement in that same
+    transaction can still fail and roll everything -- including the
+    UPDATE -- back. The counter increment must only ever happen after a
+    real commit, never inside the transaction itself."""
+    metered_store, registry = _build_metered_store(engine, window=timedelta(seconds=0.01))
+    await metered_store.record_reliability_event(make_event(evaluation_id="eval-1"))
+    await asyncio.sleep(0.02)
+
+    original_execute = AsyncConnection.execute
+
+    async def failing_execute(
+        self: AsyncConnection, statement: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        if str(statement).startswith("DELETE FROM reliability_events"):
+            raise OSError("simulated storage failure after the expiry UPDATE")
+        return await original_execute(self, statement, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(AsyncConnection, "execute", failing_execute)
+    with pytest.raises(StorageUnavailableError):
+        await metered_store.delete_reliability_events("tenant-a", before=datetime.now(timezone.utc))
+
+    async with engine.connect() as conn:
+        state = (await conn.execute(select(evaluation_links.c.state))).scalar_one()
+    assert state == "PENDING"  # the UPDATE was rolled back along with everything else
+    assert _count(registry, "test_reconciliation_expired_total") == 0.0

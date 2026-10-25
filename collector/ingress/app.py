@@ -369,11 +369,33 @@ async def receive_otlp_traces(
             DROPPED_ATTRIBUTES_TOTAL.labels(scope="resource").inc(resource_dropped)
         for otlp_span in resource_spans:
             try:
+                # F2 (review-evidence/g6-coverage-fix-review-2026-10-25):
+                # ADR-021 paragraph 65 -- "select the stored profile
+                # before applying transformations." A replay of an
+                # already-stored (tenant_id, trace_id, span_id) must
+                # normalize under *that* identity's own mapping profile,
+                # never whatever is currently active, so a mapping-
+                # version bump can never turn a byte-identical replay
+                # into a false content conflict. `None` (no prior
+                # identity, or storage genuinely has nothing for it)
+                # falls through to parse_span's own default: the
+                # currently active profile.
+                mapping_profile = await store.get_span_mapping_profile(
+                    tenant.tenant_id, otlp_span.trace_id.hex(), otlp_span.span_id.hex()
+                )
                 normalized, span_dropped = parse_span(
-                    otlp_span, resource_attributes=resource_attributes, tenant=tenant
+                    otlp_span,
+                    resource_attributes=resource_attributes,
+                    tenant=tenant,
+                    mapping_profile_override=mapping_profile,
                 )
                 if span_dropped:
                     DROPPED_ATTRIBUTES_TOTAL.labels(scope="span").inc(span_dropped)
+            except StorageUnavailableError as exc:
+                raise IngressError(
+                    IngressErrorCode.DEPENDENCY_UNAVAILABLE,
+                    "durable storage is temporarily unavailable",
+                ) from exc
             except SpanParseError as exc:
                 rejected_count += 1
                 diagnostics.append(str(exc))

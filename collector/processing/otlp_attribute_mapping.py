@@ -15,7 +15,7 @@ implementation starts.
 *package* version changes; do not equate the two.
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
@@ -167,6 +167,34 @@ def map_span_attributes(attributes: Iterable[KeyValue]) -> MappedSpanAttributes:
         extension_attributes=extension_attributes,
         dropped_attribute_keys=dropped,
     )
+
+
+MappingProfile = Callable[[Iterable[KeyValue]], MappedSpanAttributes]
+
+# F2 (review-evidence/g6-coverage-fix-review-2026-10-25): ADR-021 paragraph
+# 65 -- "replays of existing identities must be normalized using the
+# stored mapping profile ... retain its versioned normalizer for the
+# supported ... horizon." A real registry of mapping-version -> the
+# actual function that implements it, not a string allowlist plus
+# relabeling an already-mapped result: `parse_span` selects from this by
+# the *stored* identity's own mapping_version (when one exists) before
+# calling the selected function, so a later mapping version taking over
+# as MAPPING_VERSION's active value never changes what an already-stored
+# identity re-normalizes to. When a second profile is ever introduced,
+# register its own function here under its own version string and keep
+# this one's entry -- never replace it, since the whole point is that an
+# old identity can still select it after MAPPING_VERSION moves on.
+_MAPPING_PROFILES: dict[str, MappingProfile] = {
+    MAPPING_VERSION: map_span_attributes,
+}
+
+
+def get_mapping_profile(mapping_version: str) -> MappingProfile | None:
+    """Returns the registered mapper for `mapping_version`, or `None` if
+    this process no longer recognizes it at all -- ADR-021: "If it is
+    unavailable, reject explicitly rather than silently overwrite or
+    compare incompatible normalizations.\""""
+    return _MAPPING_PROFILES.get(mapping_version)
 
 
 @dataclass(frozen=True)
