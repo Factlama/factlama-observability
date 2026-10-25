@@ -6,14 +6,15 @@ layer, including both arrival orders and real transaction atomicity.
 """
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from schemas.tenancy import TenantContext
-from storage.postgres.backend import PostgresTelemetryStore
+from storage.postgres.backend import PostgresTelemetryStore, _span_to_row
+from storage.postgres.tables import spans
 from storage.spans import SpanRecordOutcome
 from tests.conformance.conftest import make_event, make_span
 
@@ -356,3 +357,70 @@ async def test_concurrent_exact_reference_without_a_span_backreference_still_lin
     trace = await store.get_trace(TENANT_A, span.trace_id)
     assert trace is not None
     assert trace.evaluation_state.value == "AVAILABLE"
+
+
+async def test_a_stale_concurrent_read_cannot_revive_an_expired_link(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1 (review-evidence/g6-read-review-2026-10-25): `get_trace`'s own
+    F3 reconciliation pass computes its result from a snapshot taken at
+    method entry -- a second, concurrent `get_trace` call that expires
+    the same link and commits first must not then be silently
+    overwritten by the first call's now-stale "still PENDING, span
+    found" conclusion once it resumes. The span is inserted directly
+    (bypassing `record_normalized_span`) so the link stays genuinely
+    PENDING -- going through the normal write path would resolve it to
+    AVAILABLE immediately, before this race could ever be set up."""
+    short_window_store = PostgresTelemetryStore(engine, reconciliation_window=timedelta(seconds=1))
+    span = make_span(project_id="proj-a", application_id="app-a")
+    event = make_event(
+        evaluation_id="eval-1",
+        trace_id=span.trace_id,
+        span_id=span.span_id,
+        project_id="proj-a",
+        application_id="app-a",
+    )
+    await short_window_store.record_reliability_event(event)
+    async with engine.begin() as conn:
+        await conn.execute(
+            spans.insert().values(
+                **_span_to_row(span, span.canonical_content_hash(), datetime.now(timezone.utc))
+            )
+        )
+
+    selected = asyncio.Event()
+    resume = asyncio.Event()
+    original_execute_2 = AsyncConnection.execute
+
+    async def synchronized_execute_2(
+        self: AsyncConnection, statement: object, *args: Any, **kwargs: Any
+    ) -> Any:
+        sql = str(statement)
+        current_task = asyncio.current_task()
+        if (
+            current_task is not None
+            and current_task.get_name() == "stale-reader"
+            and sql.startswith("SELECT")
+            and "FROM evaluation_links" in sql
+        ):
+            selected.set()
+            await asyncio.wait_for(resume.wait(), 5)
+        return await original_execute_2(self, statement, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(AsyncConnection, "execute", synchronized_execute_2)
+    stale_reader = asyncio.create_task(
+        short_window_store.get_trace(TENANT_A, span.trace_id), name="stale-reader"
+    )
+    try:
+        await asyncio.wait_for(selected.wait(), 5)
+        await asyncio.sleep(1.1)  # cross the 1-second deadline
+        expired_by_second_reader = await short_window_store.get_trace(TENANT_A, span.trace_id)
+        assert expired_by_second_reader is not None
+        assert expired_by_second_reader.evaluation_state.value == "RECONCILIATION_EXPIRED"
+    finally:
+        resume.set()
+    await stale_reader
+
+    final = await short_window_store.get_trace(TENANT_A, span.trace_id)
+    assert final is not None
+    assert final.evaluation_state.value == "RECONCILIATION_EXPIRED"

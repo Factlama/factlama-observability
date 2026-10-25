@@ -797,11 +797,25 @@ class PostgresTelemetryStore(TelemetryStore):
                         or link.span_received != row.span_received
                         or link.span_id != row.span_id
                     ):
-                        await conn.execute(
+                        # P1 (review-evidence/g6-read-review-2026-10-25):
+                        # this update must never blindly apply a result
+                        # computed from a stale snapshot -- a concurrent
+                        # reader could have already expired (or otherwise
+                        # changed) this same row after we read it but
+                        # before we write. The `state == row.state`
+                        # precondition makes the write conditional on
+                        # nothing having changed since our own read; if
+                        # another writer got there first, this affects
+                        # zero rows, and we reload the now-committed row
+                        # and trust it completely instead of our own
+                        # stale computation -- never retried, never
+                        # merged with it.
+                        result = await conn.execute(
                             update(evaluation_links)
                             .where(
                                 evaluation_links.c.tenant_id == tenant.tenant_id,
                                 evaluation_links.c.evaluation_id == link.evaluation_id,
+                                evaluation_links.c.state == row.state,
                             )
                             .values(
                                 state=link.state,
@@ -809,6 +823,17 @@ class PostgresTelemetryStore(TelemetryStore):
                                 span_id=link.span_id,
                             )
                         )
+                        if result.rowcount == 0:
+                            fresh_row = (
+                                await conn.execute(
+                                    select(evaluation_links).where(
+                                        evaluation_links.c.tenant_id == tenant.tenant_id,
+                                        evaluation_links.c.evaluation_id == link.evaluation_id,
+                                    )
+                                )
+                            ).first()
+                            if fresh_row is not None:
+                                link = _row_to_link(fresh_row)
                     links.append(link)
         except (SQLAlchemyError, OSError, PostgresError) as exc:
             raise StorageUnavailableError(f"could not read trace {trace_id!r}: {exc}") from exc
