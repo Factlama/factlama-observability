@@ -23,7 +23,7 @@ from typing import Any
 
 from asyncpg import PostgresError  # type: ignore[import-untyped]
 from prometheus_client import Counter
-from sqlalchemy import delete, exists, literal, select, tuple_, update
+from sqlalchemy import and_, delete, exists, literal, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -80,6 +80,19 @@ logger = logging.getLogger(__name__)
 DEFAULT_RECONCILIATION_WINDOW = timedelta(hours=24)
 """ADR-021: "Default 24 hours, configurable within (0, 72 hours]." """
 MAX_RECONCILIATION_WINDOW = timedelta(hours=72)
+
+DEFAULT_REPLAY_HORIZON = MAX_RECONCILIATION_WINDOW
+"""R6 (review-evidence/g6-coverage-review-2026-10-25): ADR-021: "Retain
+bounded expiry markers for as long as the corresponding source/identity
+can be replayed under the supported retention policy." This is a
+separate time budget from the caller's own retention `before` cutoff --
+"a caller-supplied before cutoff is not a replay admission boundary;
+deleting markers without one would revive expired identities" (same
+review). An expired marker must stay protected for at least this long
+*after* its own deadline, regardless of how aggressive a `before` the
+caller passes -- bounded here to the same 72-hour ceiling ADR-021 already
+places on the reconciliation window itself, the system's own stated
+upper bound on how stale a legitimate redelivery could be."""
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -250,6 +263,7 @@ class PostgresTelemetryStore(TelemetryStore):
         engine: AsyncEngine,
         *,
         reconciliation_window: timedelta = DEFAULT_RECONCILIATION_WINDOW,
+        replay_horizon: timedelta = DEFAULT_REPLAY_HORIZON,
         reconciliation_expired_counter: Counter | None = None,
         reconciliation_conflict_counter: Counter | None = None,
     ) -> None:
@@ -258,8 +272,11 @@ class PostgresTelemetryStore(TelemetryStore):
                 f"reconciliation_window must be in (0, {MAX_RECONCILIATION_WINDOW}], "
                 f"got {reconciliation_window}"
             )
+        if replay_horizon <= timedelta(0):
+            raise ValueError(f"replay_horizon must be positive, got {replay_horizon}")
         self._engine = engine
         self._reconciliation_window = reconciliation_window
+        self._replay_horizon = replay_horizon
         # G6_FINAL_REVIEW_2026-10-24.md: "once-per-link reconciliation-
         # expiry/conflict metrics are not wired through the current
         # parser/storage paths." `None` (the default, used by every
@@ -345,6 +362,20 @@ class PostgresTelemetryStore(TelemetryStore):
                             ],
                         )
                         if resolved is not None:
+                            # R2 (review-evidence/g6-coverage-review-2026-10-25):
+                            # resolving this trace already required finding
+                            # spans sharing this interaction_id -- that is
+                            # span-side proof on its own. `source="span"`
+                            # (not "event", which only re-affirms a flag
+                            # already set by this function's first touch
+                            # above) completes the match directly; routing
+                            # this through the exact-unique-span-matching
+                            # block below instead left the link PENDING
+                            # forever whenever the resolved trace legitimately
+                            # contains more than one span, since that block
+                            # requires picking exactly *one* span, which a
+                            # trace-level match (ADR-021: "using trace_id
+                            # alone") was never supposed to need.
                             link = await self._touch_evaluation_link(
                                 conn,
                                 tenant_id=event.tenant_id,
@@ -354,7 +385,7 @@ class PostgresTelemetryStore(TelemetryStore):
                                 trace_id=resolved,
                                 span_id=None,
                                 interaction_id=event.interaction_id,
-                                source="event",
+                                source="span",
                                 now=received_at,
                             )
                             resolved_trace_id = resolved
@@ -655,22 +686,24 @@ class PostgresTelemetryStore(TelemetryStore):
         is at least as old as this same cutoff -- so a link still
         legitimately waiting on its other half is never dropped early.
 
-        R4 (review-evidence/g6-final-2026-10-24): a `RECONCILIATION_
-        EXPIRED` marker is never deleted by this call at all, regardless
-        of how old it or its source rows are. Deleting it, even once its
-        source rows are also gone, is exactly what let a replay of the
-        identical old `(tenant_id, event_id)` -- indistinguishable from
-        a brand-new event once its row is gone -- recreate a fresh
-        `PENDING` link and complete normally, reviving a correlation
-        ADR-021 requires to stay permanently expired. There is currently
-        no implemented bound on how long a caller might still replay an
-        old identity, so the only sound policy is to retain every
-        expired marker indefinitely until a real, separately-tested
-        replay-horizon mechanism exists to retire them -- the `before`
-        cutoff below applies only to `reliability_events`/`spans`, never
-        to a `RECONCILIATION_EXPIRED` row. ADR-021 itself anticipates
-        exactly this: "retain bounded expiry markers for as long as the
-        corresponding source/identity can be replayed."
+        R6 (review-evidence/g6-coverage-review-2026-10-25): a bounded
+        replay horizon, superseding R4 (review-evidence/
+        g6-final-2026-10-24)'s "retain every expired marker indefinitely"
+        rule -- that rule was deliberately provisional ("until a real,
+        separately-tested replay-horizon mechanism exists"), and the new
+        admin-authenticated deletion endpoint made permanent retention an
+        actual operational path rather than a theoretical one. ADR-021:
+        "Retain bounded expiry markers for as long as the corresponding
+        source/identity can be replayed under the supported retention
+        policy." Per explicit project-owner direction (no default
+        retention period, `before` always the caller's own decision):
+        the operator's own `before` cutoff *is* the replay horizon here
+        too, applied to the marker's `expires_at` rather than exempting
+        `RECONCILIATION_EXPIRED` rows altogether -- a marker is eligible
+        for deletion once its deadline is at least as old as `before`,
+        the same safety margin a non-expired marker already gets against
+        its own `first_received_at`. The existing source-nonexistence
+        guards below still apply identically to both cases.
         """
         event_clauses: list[ColumnElement[bool]] = [
             reliability_events.c.tenant_id == tenant_id,
@@ -680,10 +713,27 @@ class PostgresTelemetryStore(TelemetryStore):
             spans.c.tenant_id == tenant_id,
             spans.c.received_at < before,
         ]
+        # R6: the hard floor a caller's own `before` can never shorten --
+        # an expired marker must stay protected for at least
+        # `self._replay_horizon` *past its own deadline*, regardless of
+        # how aggressive a `before` is passed. Evaluated against the real
+        # clock, not `before` itself, so this floor cannot be bypassed by
+        # simply choosing a far-future cutoff.
+        replay_eligible_before = datetime.now(timezone.utc) - self._replay_horizon
         link_clauses: list[ColumnElement[bool]] = [
             evaluation_links.c.tenant_id == tenant_id,
-            evaluation_links.c.first_received_at < before,
-            evaluation_links.c.state != RECONCILIATION_EXPIRED,
+            or_(
+                and_(
+                    evaluation_links.c.state != RECONCILIATION_EXPIRED,
+                    evaluation_links.c.first_received_at < before,
+                ),
+                and_(
+                    evaluation_links.c.state == RECONCILIATION_EXPIRED,
+                    evaluation_links.c.expires_at.isnot(None),
+                    evaluation_links.c.expires_at < before,
+                    evaluation_links.c.expires_at < replay_eligible_before,
+                ),
+            ),
             ~exists(
                 select(1).where(
                     reliability_events.c.tenant_id == evaluation_links.c.tenant_id,
@@ -714,7 +764,7 @@ class PostgresTelemetryStore(TelemetryStore):
                 # read) -- without this, `state != RECONCILIATION_EXPIRED`
                 # below would not catch it, reopening R4's exact hole for
                 # a row simply nobody happened to touch recently.
-                await conn.execute(
+                expiry_result = await conn.execute(
                     update(evaluation_links)
                     .where(
                         evaluation_links.c.tenant_id == tenant_id,
@@ -724,6 +774,17 @@ class PostgresTelemetryStore(TelemetryStore):
                     )
                     .values(state=RECONCILIATION_EXPIRED)
                 )
+                # R3 (review-evidence/g6-coverage-review-2026-10-25): this
+                # bulk transition is a real PENDING -> RECONCILIATION_EXPIRED
+                # flip like any other -- it must count toward
+                # obs_reconciliation_expired_total exactly like the
+                # touch/read-driven transitions already do, not bypass it.
+                # `rowcount` is exactly the set of rows this statement's own
+                # WHERE clause actually matched (state == PENDING), so this
+                # can never double-count a row already expired by an
+                # earlier call or touch.
+                if self._reconciliation_expired_total is not None and expiry_result.rowcount:
+                    self._reconciliation_expired_total.inc(expiry_result.rowcount)
                 event_result = await conn.execute(delete(reliability_events).where(*event_clauses))
                 await conn.execute(delete(spans).where(*span_clauses))
                 # The marker goes last: by the time this runs, the source
@@ -926,6 +987,127 @@ class PostgresTelemetryStore(TelemetryStore):
                 ]
 
                 links: list[EvaluationLinkRow] = []
+
+                # R1 (review-evidence/g6-coverage-review-2026-10-25): an
+                # interaction-only link (no trace_id at all) can never be
+                # found by the `trace_id == trace_id` query above, so a
+                # concurrent-arrival race where neither
+                # record_reliability_event's nor record_normalized_span's
+                # own resolution attempt saw the other's row before
+                # committing leaves it permanently stuck at `trace_id IS
+                # NULL`, invisible to every future read of the trace it
+                # should belong to -- unlike every other PENDING link,
+                # which the lazy-expiry loop below always revisits. This
+                # is that same lazy-recovery point for the interaction-only
+                # case: any still-unresolved link sharing an interaction_id
+                # with one of this trace's own spans is worth re-checking
+                # now, against every span in the tenant sharing that
+                # interaction_id (not just this trace's), the same
+                # uniqueness rule the write path already applies.
+                interaction_ids_in_trace = {
+                    row.interaction_id for row in span_rows if row.interaction_id is not None
+                }
+                if interaction_ids_in_trace:
+                    pending_interaction_rows = (
+                        await conn.execute(
+                            select(evaluation_links).where(
+                                evaluation_links.c.tenant_id == tenant.tenant_id,
+                                evaluation_links.c.interaction_id.in_(interaction_ids_in_trace),
+                                evaluation_links.c.trace_id.is_(None),
+                                evaluation_links.c.state == PENDING,
+                            )
+                        )
+                    ).all()
+                    for pending_row in pending_interaction_rows:
+                        locked_pending_row = (
+                            await conn.execute(
+                                select(evaluation_links)
+                                .where(
+                                    evaluation_links.c.tenant_id == tenant.tenant_id,
+                                    evaluation_links.c.evaluation_id == pending_row.evaluation_id,
+                                )
+                                .with_for_update()
+                            )
+                        ).first()
+                        if locked_pending_row is None or locked_pending_row.state != PENDING:
+                            # Already resolved or expired by whichever
+                            # transaction held this lock before us --
+                            # nothing left for this read to recover; it
+                            # will show up via the normal `trace_id ==
+                            # trace_id` query above on this or a later read.
+                            continue
+                        pending_link = _row_to_link(locked_pending_row)
+                        now = datetime.now(timezone.utc)
+                        if pending_link.expires_at is not None and now >= pending_link.expires_at:
+                            if self._reconciliation_expired_total is not None:
+                                self._reconciliation_expired_total.inc()
+                            await conn.execute(
+                                update(evaluation_links)
+                                .where(
+                                    evaluation_links.c.tenant_id == tenant.tenant_id,
+                                    evaluation_links.c.evaluation_id == pending_link.evaluation_id,
+                                )
+                                .values(state=RECONCILIATION_EXPIRED)
+                            )
+                            if pending_link.interaction_id in interaction_ids_in_trace:
+                                links.append(replace(pending_link, state=RECONCILIATION_EXPIRED))
+                            continue
+
+                        interaction_span_rows = (
+                            await conn.execute(
+                                select(
+                                    spans.c.trace_id, spans.c.project_id, spans.c.application_id
+                                ).where(
+                                    spans.c.tenant_id == tenant.tenant_id,
+                                    spans.c.interaction_id == pending_link.interaction_id,
+                                )
+                            )
+                        ).all()
+                        resolved = select_unique_trace_for_interaction(
+                            link_project_id=pending_link.project_id,
+                            link_application_id=pending_link.application_id,
+                            candidates=[
+                                InteractionSpanCandidate(
+                                    row.trace_id, row.project_id, row.application_id
+                                )
+                                for row in interaction_span_rows
+                            ],
+                        )
+                        if resolved is None:
+                            continue
+                        # R2's same fix applies here: resolving the trace
+                        # already required a scope-compatible span to
+                        # exist sharing this interaction_id -- that is
+                        # span-side proof on its own, and an
+                        # interaction-only link's creator can only ever
+                        # have been an event (a span always carries its
+                        # own real trace_id, never `None`), so
+                        # event_received is already true.
+                        resolved_link = replace(
+                            pending_link,
+                            trace_id=resolved,
+                            span_received=True,
+                            state=AVAILABLE,
+                        )
+                        await conn.execute(
+                            update(evaluation_links)
+                            .where(
+                                evaluation_links.c.tenant_id == tenant.tenant_id,
+                                evaluation_links.c.evaluation_id == pending_link.evaluation_id,
+                            )
+                            .values(
+                                trace_id=resolved_link.trace_id,
+                                span_received=resolved_link.span_received,
+                                state=resolved_link.state,
+                            )
+                        )
+                        if resolved == trace_id:
+                            links.append(resolved_link)
+                        # else: resolved to a different trace than the one
+                        # this call is reading -- correctly persisted for
+                        # that trace's own future reads, but not part of
+                        # this result.
+
                 for row in link_rows:
                     if row.state != PENDING:
                         # AVAILABLE and RECONCILIATION_EXPIRED are both

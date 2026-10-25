@@ -9,7 +9,7 @@ machine; this proves the storage layer's own instrumentation around it.
 """
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from prometheus_client import CollectorRegistry, Counter, generate_latest
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -127,4 +127,22 @@ async def test_a_conflict_on_an_already_expired_link_increments_both_counters(
     await metered_store.record_normalized_span(conflicting_span)
 
     assert _count(registry, "test_reconciliation_conflict_total") == 1.0
+    assert _count(registry, "test_reconciliation_expired_total") == 1.0
+
+
+async def test_retention_triggered_expiry_increments_the_expired_counter(
+    engine: AsyncEngine,
+) -> None:
+    """R3 (review-evidence/g6-coverage-review-2026-10-25):
+    `delete_reliability_events`'s own bulk PENDING -> RECONCILIATION_EXPIRED
+    normalization is a real transition like any other touch/read-driven
+    one and must count the same way, not bypass the counter entirely."""
+    metered_store, registry = _build_metered_store(engine, window=timedelta(seconds=0.1))
+    await metered_store.record_reliability_event(
+        make_event(evaluation_id="eval-1", trace_id="0" * 32)
+    )
+    await asyncio.sleep(0.2)
+
+    await metered_store.delete_reliability_events("tenant-a", before=datetime.now(timezone.utc))
+
     assert _count(registry, "test_reconciliation_expired_total") == 1.0

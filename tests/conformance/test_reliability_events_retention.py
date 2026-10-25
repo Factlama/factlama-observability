@@ -206,16 +206,21 @@ async def test_application_scoped_deletion_also_scopes_its_evaluation_link_delet
     assert await _link_exists(engine, "tenant-a", "eval-b")
 
 
-async def test_retention_never_deletes_an_expired_marker_even_once_fully_orphaned(
+async def test_an_expired_marker_within_the_replay_horizon_is_never_deleted(
     store: PostgresTelemetryStore, engine: AsyncEngine
 ) -> None:
-    """R4 (review-evidence/g6-final-2026-10-24): a `RECONCILIATION_
-    EXPIRED` marker must never be deleted by this call, no matter how
-    old it or its source rows are -- deleting it is exactly what let a
-    replay of the identical old `(tenant_id, event_id)` (indistinguishable
-    from a brand-new event once its row is gone) recreate a fresh
-    `PENDING` link and complete normally, reviving a correlation that
-    must stay permanently expired."""
+    """R4 (review-evidence/g6-final-2026-10-24), refined by R6 (review-
+    evidence/g6-coverage-review-2026-10-25): a `RECONCILIATION_EXPIRED`
+    marker must not be deleted while still within its replay horizon
+    (`PostgresTelemetryStore`'s default 72 hours past its own deadline),
+    no matter how aggressive a `before` the caller passes -- deleting it
+    early is exactly what let a replay of the identical old
+    `(tenant_id, event_id)` (indistinguishable from a brand-new event
+    once its row is gone) recreate a fresh `PENDING` link and complete
+    normally, reviving a correlation that must stay expired. Unlike R4's
+    original "never, regardless of age" rule, this marker is *not*
+    permanent -- see the companion test below for deletion once the
+    horizon has actually passed."""
     span = make_span(evaluation_id="eval-1", trace_id="0123456789abcdef0123456789abcdef")
     event = make_event(evaluation_id="eval-1", trace_id=span.trace_id, span_id=span.span_id)
     await store.record_reliability_event(event)
@@ -233,6 +238,10 @@ async def test_retention_never_deletes_an_expired_marker_even_once_fully_orphane
     assert trace is not None
     assert trace.evaluation_state.value == "RECONCILIATION_EXPIRED"
 
+    # expires_at here is `old + 24h` ~= now - 2 days -- well inside the
+    # default 72-hour replay horizon measured from the real clock, even
+    # though `before` itself (an aggressive, caller-chosen cutoff) would
+    # otherwise have been satisfied on its own.
     deleted = await store.delete_reliability_events(
         "tenant-a", before=datetime.now(timezone.utc) - timedelta(days=1)
     )
@@ -247,3 +256,69 @@ async def test_retention_never_deletes_an_expired_marker_even_once_fully_orphane
     trace = await store.get_trace(TENANT_A, span.trace_id)
     assert trace is not None
     assert trace.evaluation_state.value == "RECONCILIATION_EXPIRED"
+
+
+async def test_an_expired_marker_past_the_replay_horizon_is_deleted(
+    engine: AsyncEngine,
+) -> None:
+    """R6 (review-evidence/g6-coverage-review-2026-10-25): ADR-021
+    requires a *bounded* horizon, not permanent retention -- once a
+    marker's deadline is further in the past than the configured replay
+    horizon, it becomes eligible for deletion like any other fully
+    orphaned row, and the caller's own `before` cutoff still applies on
+    top of that floor (never automatically; `before` must still cover
+    it)."""
+    store = PostgresTelemetryStore(engine, replay_horizon=timedelta(hours=1))
+    span = make_span(evaluation_id="eval-1", trace_id="0123456789abcdef0123456789abcdef")
+    event = make_event(evaluation_id="eval-1", trace_id=span.trace_id, span_id=span.span_id)
+    await store.record_reliability_event(event)
+
+    old = datetime.now(timezone.utc) - timedelta(days=3)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(evaluation_links).values(
+                first_received_at=old, expires_at=old + timedelta(hours=24)
+            )
+        )
+        await conn.execute(update(reliability_events).values(received_at=old))
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "RECONCILIATION_EXPIRED"
+
+    # expires_at (~now - 2 days) is now well past this store's own
+    # 1-hour replay horizon, and `before` (now) covers it too.
+    deleted = await store.delete_reliability_events("tenant-a", before=datetime.now(timezone.utc))
+    assert deleted == 1
+    assert not await _link_exists(engine, "tenant-a", "eval-1")
+
+
+async def test_a_caller_before_cutoff_cannot_shorten_the_replay_horizon(
+    engine: AsyncEngine,
+) -> None:
+    """The floor is enforced against the real clock, not against
+    `before` -- a caller cannot delete a marker early just by passing a
+    far-future cutoff."""
+    store = PostgresTelemetryStore(engine, replay_horizon=timedelta(days=3))
+    span = make_span(evaluation_id="eval-1", trace_id="0123456789abcdef0123456789abcdef")
+    event = make_event(evaluation_id="eval-1", trace_id=span.trace_id, span_id=span.span_id)
+    await store.record_reliability_event(event)
+
+    old = datetime.now(timezone.utc) - timedelta(hours=2)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(evaluation_links).values(
+                first_received_at=old, expires_at=old + timedelta(hours=1)
+            )
+        )
+        await conn.execute(update(reliability_events).values(received_at=old))
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "RECONCILIATION_EXPIRED"
+
+    deleted = await store.delete_reliability_events(
+        "tenant-a", before=datetime.now(timezone.utc) + timedelta(days=365)
+    )
+    assert deleted == 1  # the source event is still deleted...
+    assert await _link_exists(engine, "tenant-a", "eval-1")  # ...but the marker is not

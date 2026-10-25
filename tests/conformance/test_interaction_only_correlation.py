@@ -8,11 +8,100 @@ proves it wired into the real storage layer, both arrival orders,
 against real PostgreSQL.
 """
 
+import asyncio
+from typing import Any
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+
 from schemas.tenancy import TenantContext
 from storage.postgres.backend import PostgresTelemetryStore
 from tests.conformance.conftest import make_event, make_span
 
 TENANT_A = TenantContext(tenant_id="tenant-a")
+
+
+async def test_multiple_spans_in_the_qualifying_trace_still_resolve_to_available(
+    store: PostgresTelemetryStore,
+) -> None:
+    """R2 (review-evidence/g6-coverage-review-2026-10-25): resolving a
+    unique trace via interaction matching must not then require picking
+    exactly *one* span within it -- a trace legitimately containing more
+    than one scope-compatible span is still a unique, unambiguous
+    resolution; it is a *different* distinct trace_id that is ambiguous,
+    never the span count within one already-resolved trace."""
+    span_one = make_span(interaction_id="int-1", project_id="proj-a", application_id="app-a")
+    span_two = make_span(
+        span_id="f" * 16, interaction_id="int-1", project_id="proj-a", application_id="app-a"
+    )
+    await store.record_normalized_span(span_one)
+    await store.record_normalized_span(span_two)
+    await store.record_reliability_event(
+        make_event(
+            evaluation_id="eval-1",
+            interaction_id="int-1",
+            project_id="proj-a",
+            application_id="app-a",
+        )
+    )
+
+    trace = await store.get_trace(TENANT_A, span_one.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"
+
+
+async def test_concurrent_interaction_only_arrivals_recover_on_read(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 (review-evidence/g6-coverage-review-2026-10-25): the event's
+    own interaction lookup (querying `spans`) and the span's own reverse
+    lookup (querying `evaluation_links`) can each run before the other
+    transaction commits its insert -- read-committed isolation means
+    neither sees the other's row yet, so both inserts succeed but
+    neither resolves the link. `get_trace`'s own lazy-recovery pass (the
+    new block this fix adds, mirroring the lazy-expiry recovery point
+    already established for F3) is what must catch this afterward."""
+    store = PostgresTelemetryStore(engine)
+    span = make_span(interaction_id="int-1", project_id="proj-a", application_id="app-a")
+    event = make_event(
+        evaluation_id="eval-1",
+        interaction_id="int-1",
+        project_id="proj-a",
+        application_id="app-a",
+    )
+
+    seen: set[str] = set()
+    both_queried = asyncio.Event()
+    original_execute = AsyncConnection.execute
+
+    async def synchronized_execute(
+        self: AsyncConnection, statement: object, *args: Any, **kwargs: Any
+    ) -> Any:
+        sql = str(statement)
+        task_name = asyncio.current_task().get_name()  # type: ignore[union-attr]
+        is_target = (
+            task_name == "event-task" and "FROM spans" in sql and "spans.interaction_id" in sql
+        ) or (
+            task_name == "span-task"
+            and "FROM evaluation_links" in sql
+            and "evaluation_links.interaction_id" in sql
+        )
+        if sql.startswith("SELECT") and is_target:
+            seen.add(task_name)
+            if len(seen) == 2:
+                both_queried.set()
+            await asyncio.wait_for(both_queried.wait(), 5)
+        return await original_execute(self, statement, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(AsyncConnection, "execute", synchronized_execute)
+    await asyncio.gather(
+        asyncio.create_task(store.record_reliability_event(event), name="event-task"),
+        asyncio.create_task(store.record_normalized_span(span), name="span-task"),
+    )
+
+    trace = await store.get_trace(TENANT_A, span.trace_id)
+    assert trace is not None
+    assert trace.evaluation_state.value == "AVAILABLE"
 
 
 async def test_event_first_interaction_only_resolves_to_the_sole_matching_trace(
