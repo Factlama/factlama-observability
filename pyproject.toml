@@ -34,6 +34,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# OBS-13 (2026-10-26): the two runtime dependencies `sdk/` actually needs
+# -- a separate extras group, not base `[project.dependencies]`, since the
+# SDK ships to a customer's process and must not pull in this
+# distribution's server-only weight (sqlalchemy/asyncpg/alembic).
+sdk = [
+    "httpx>=0.27.0",
+    "opentelemetry-proto==1.45.1",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
