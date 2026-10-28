@@ -1,36 +1,45 @@
 """OBS-13: `FactLamaClient` -- the installable slice of the SDK
 (`docs/SDK.md`, `docs/LOW_LEVEL_IMPLEMENTATION.md`'s "Python SDK" section).
 
-Implements `FactLamaClient(config)`, `client.submit_verification(...)`,
-`client.get_verification_job(...)`, `client.llm_span`/`retrieval_span`/
-`tool_span` context managers, `client.flush(timeout)`/`close(timeout)`,
-and capture-mode suppression (`FactLamaConfig.capture_mode == "NONE"`
-stops a span from ever being queued or exported). Deliberately NOT
-implemented yet (`docs/LOW_LEVEL_IMPLEMENTATION.md`: "Do not add
-framework auto-instrumentation until explicit wrappers work and have
-tests"):
+Implements `FactLamaClient(config)`, `client.verify(...)`,
+`client.submit_verification(...)`, `client.get_verification_job(...)`,
+`client.llm_span`/`retrieval_span`/`tool_span` context managers,
+`client.flush(timeout)`/`close(timeout)`, and capture-mode suppression
+(`FactLamaConfig.capture_mode == "NONE"` stops a span from ever being
+queued or exported). Deliberately NOT implemented yet
+(`docs/LOW_LEVEL_IMPLEMENTATION.md`: "Do not add framework
+auto-instrumentation until explicit wrappers work and have tests"): a
+periodic background export thread (see `sdk/queue.py`'s own module
+docstring for why `flush`/`close` stay explicit-only this pass).
 
-- `client.verify(request)` (the synchronous direct-call path). Hard
-  constraint, not a style choice: `factlama-reliability`'s synchronous
-  `POST /v0.1/verifications` never produces an `OutboxEvent`/
-  `ReliabilityEvent` -- only `commit_evaluation_and_outbox`, called solely
-  from the async job-worker path, does. A sync call has no mechanism to
-  ever become correlatable in Observability under the current
-  architecture, so building `verify()` now would not serve this slice's
-  "one correlated evaluation" goal. Revisit once a sync-path telemetry
-  hook exists on the Reliability side.
-- A periodic background export thread (see `sdk/queue.py`'s own module
-  docstring for why `flush`/`close` stay explicit-only this pass).
+`client.verify(request)`'s own span is permanently, architecturally
+uncorrelated -- not a gap this package can close, and not the same thing
+as "not yet built." `factlama-reliability`'s synchronous
+`POST /v0.1/verifications` never produces an `OutboxEvent`/
+`ReliabilityEvent` -- only `commit_evaluation_and_outbox`, called solely
+from the async job-worker path, does. So unlike `submit_verification`'s
+span, `verify()`'s span can never show up linked to an evaluation in
+Observability's `GET /v0.1/ai/traces/{trace_id}`, regardless of anything
+this SDK does. It is still built and still exported: the span carries
+real standalone value (latency, success/failure, W3C trace context for
+whatever broader trace this call is nested in), and `docs/
+LOW_LEVEL_IMPLEMENTATION.md` names `verify` as required public surface
+("Python `verify`/async client ... direct and async API examples pass").
+Revisit full correlation only if a sync-path telemetry hook is ever added
+on the Reliability side.
 
-Design note on why `submit_verification`'s own `VERIFICATION` span is NOT
-routed through `sdk.queue.BoundedSpanQueue`: that span's synchronous,
-export-within-the-call behavior was already built, tested and
-independently reviewed as part of this slice's first approved pass.
-Moving it onto the new queue would change its delivery timing for no
-benefit this slice needs, and would be an unreviewed behavior change to
-already-approved code. `llm_span`/`retrieval_span`/`tool_span` are new
-surface with no prior approved behavior to preserve, so they use the
-queue from the start.
+Design note on why `submit_verification`'s and `verify()`'s own
+`VERIFICATION` spans are NOT routed through `sdk.queue.BoundedSpanQueue`:
+`submit_verification`'s synchronous, export-within-the-call behavior was
+already built, tested and independently reviewed as part of this slice's
+first approved pass -- moving it onto the new queue would change its
+delivery timing for no benefit this slice needs, and would be an
+unreviewed behavior change to already-approved code. `verify()` mirrors
+that same synchronous-export discipline for symmetry with its sibling
+business call, rather than introducing a second, differently-timed
+export path for what is conceptually the same kind of span.
+`llm_span`/`retrieval_span`/`tool_span` are new surface with no prior
+approved behavior to preserve, so they use the queue from the start.
 """
 
 import logging
@@ -85,6 +94,21 @@ class VerificationJobHandle:
     span_id: str
     interaction_id: str
     raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class VerificationResultHandle:
+    """What `verify()` returns: the full synchronous result plus the
+    trace/span/interaction IDs used for this call's own exported span.
+    No `job_id`/`state` fields -- there is no job, the result is already
+    final. Deliberately carries no correlation guarantee: see `verify()`'s
+    own docstring and this module's docstring for why its span can never
+    show up linked to an evaluation in Observability."""
+
+    trace_id: str
+    span_id: str
+    interaction_id: str
+    result: dict[str, Any]
 
 
 class FactLamaClient:
@@ -243,6 +267,89 @@ class FactLamaClient:
                         extra_attributes=_extra_attributes(handle),
                         extra_int_attributes=_extra_int_attributes(handle),
                     )
+                )
+
+    def verify(self, request: dict[str, Any]) -> VerificationResultHandle:
+        """POSTs `request` directly to `{reliability_api_url}/v0.1/verifications`
+        and returns the full synchronous result -- no job, no polling.
+
+        Fills `trace_id`/`span_id`/`interaction_id` into the request only
+        when the caller omitted them, same convention as
+        `submit_verification`. A caller-supplied value is sent through
+        completely unchanged, never overwritten.
+
+        Exports exactly one best-effort `VERIFICATION` span for this
+        call, wrapped around the HTTP round trip in a `finally`, exactly
+        like `submit_verification`'s own export discipline -- export
+        failure (a collector outage, a network error) can never affect
+        whether this method raises or what it returns, and a raise here
+        can never prevent the span attempt.
+
+        This span is **permanently, architecturally uncorrelated** --
+        see this module's own docstring for why. It is not a lesser
+        version of `submit_verification`'s span; it is a different kind
+        of span by design, carrying latency/success/failure and W3C trace
+        context on its own, never a link to a persisted evaluation.
+
+        Raises `VerificationSubmitError` for a non-200 response or any
+        network failure on the Reliability call itself -- this is the
+        caller's explicit business call, not best-effort telemetry; a
+        collector outage affecting only the span export below can never
+        raise this or any other error, and never changes the returned
+        result.
+        """
+        trace_id = request.get("trace_id") or new_trace_id()
+        span_id = request.get("span_id") or new_span_id()
+        interaction_id = request.get("interaction_id") or new_interaction_id()
+        body = {
+            **request,
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "interaction_id": interaction_id,
+        }
+
+        started_at = datetime.now(timezone.utc)
+        status_ok = False
+        try:
+            response = self._http.post(
+                f"{self._config.reliability_api_url}/v0.1/verifications",
+                json=body,
+                headers={"Authorization": f"Bearer {self._config.api_key}"},
+                timeout=self._config.request_timeout_seconds,
+            )
+            if response.status_code != 200:
+                raise VerificationSubmitError(
+                    f"verify failed: HTTP {response.status_code}: {response.text}",
+                    status_code=response.status_code,
+                )
+            status_ok = True
+            return VerificationResultHandle(
+                trace_id=trace_id,
+                span_id=span_id,
+                interaction_id=interaction_id,
+                result=response.json(),
+            )
+        except httpx.HTTPError as exc:
+            raise VerificationSubmitError(f"verify failed: {exc}") from exc
+        finally:
+            if self._should_capture():
+                ended_at = datetime.now(timezone.utc)
+                export_span(
+                    SpanData(
+                        trace_id=trace_id,
+                        span_id=span_id,
+                        operation_type=_VERIFICATION_OPERATION_TYPE,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                        status_ok=status_ok,
+                        project_id=self._config.project_id,
+                        application_id=self._config.application_id,
+                    ),
+                    collector_url=self._config.collector_url,
+                    api_key=self._config.api_key,
+                    service_name=self._config.service_name,
+                    timeout_seconds=self._config.request_timeout_seconds,
+                    client=self._http,
                 )
 
     def submit_verification(
