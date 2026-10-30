@@ -58,6 +58,86 @@ class QualificationStatusOrMixed(str, Enum):
     MIXED = "MIXED"
 
 
+class ClaimFindingStatus(str, Enum):
+    """ADR-022's normalized claim finding status.
+
+    Deliberately narrower than the full claim-verdict vocabulary: a claim
+    whose verdict is `NOT_APPLICABLE` (out of scope for factual
+    verification) or `DISPUTED` is not a reliability *finding*. Reliability
+    omits such claims from `ClaimSummary.findings` while still counting
+    them in `total_claim_count`, so `total_claim_count - len(findings)` is
+    the no-finding count. Receiving one of those values here would be a
+    producer bug, and the wire schema rejects it before we ever parse it.
+    """
+
+    SUPPORTED = "SUPPORTED"
+    UNSUPPORTED = "UNSUPPORTED"
+    CONTRADICTED = "CONTRADICTED"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+
+class ClaimFinding(BaseModel):
+    """ADR-022: one claim's non-content finding.
+
+    `model_config` forbids extra fields, mirroring the wire schema's own
+    `"additionalProperties": false` on this one object. That is the
+    privacy boundary, enforced on the *consumer* side too: if a future
+    producer ever attached claim text, a prompt, a response, evidence, a
+    citation, a tool argument or free-form judge rationale, this model
+    would reject the event at ingress rather than persist content this
+    repo is not allowed to hold. Do not relax this to tolerate additive
+    fields -- that tolerance is exactly what would let content through.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: ClaimFindingStatus
+    rationale_code: str | None = Field(
+        None,
+        description=(
+            "Bounded, versioned tag from CONTRACTS.md's RationaleCode vocabulary. "
+            "Rendered as inert text; never interpreted as markup."
+        ),
+    )
+
+
+class ClaimSummary(BaseModel):
+    """ADR-022's optional claim-summary projection.
+
+    Three states a consumer must keep distinct, and the reason this type
+    exists at all rather than a bare count:
+
+    - the whole object absent (`ReliabilityEvent.claim_summary is None`):
+      claim data is **UNAVAILABLE**. The producer predates ADR-022 or does
+      not publish claims. Reporting this as zero findings would invent a
+      clean reliability picture out of missing data, which ADR-022
+      rejects explicitly.
+    - `total_claim_count == 0`: the evaluation genuinely had no claims.
+    - `total_claim_count > 0` with fewer (or zero) `findings`: some claims
+      produced no projectable finding (see `ClaimFindingStatus`).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    total_claim_count: int = Field(..., ge=0)
+    findings: dict[str, ClaimFinding] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_total_covers_findings(self) -> "ClaimSummary":
+        """`total_claim_count` counts every claim, findings included, so it
+        can never be smaller than the number of findings. A producer
+        sending otherwise is internally inconsistent -- rejecting it here
+        keeps the derived "claims with no finding" count from going
+        negative in every downstream aggregate and dashboard cell."""
+        if self.total_claim_count < len(self.findings):
+            raise ValueError(
+                "claim_summary.total_claim_count "
+                f"({self.total_claim_count}) is smaller than the number of findings "
+                f"({len(self.findings)}); it counts every claim, findings included"
+            )
+        return self
+
+
 class ScoreValue(BaseModel):
     """One named score dimension with its measurement status and provenance."""
 
@@ -119,6 +199,13 @@ class ReliabilityEvent(BaseModel):
     )
     qualification_status: QualificationStatusOrMixed
     usage_summary: Usage = Field(default_factory=Usage)
+    claim_summary: ClaimSummary | None = Field(
+        default=None,
+        description=(
+            "ADR-022's claim-level projection. `None` means the producer sent none, "
+            "which consumers MUST render as unavailable, never as zero findings."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_schema_version(self) -> "ReliabilityEvent":

@@ -29,10 +29,17 @@ from operations.concurrency import ConcurrencyLimiter, PerTenantConcurrencyLimit
 from operations.metrics import install_metrics
 from operations.request_deadline import RequestDeadlineMiddleware
 from query.api.bootstrap import check_storage_ready, lifespan
-from query.api.cursor import CursorError, decode_cursor, encode_cursor
+from query.api.cursor import (
+    CursorError,
+    decode_cursor,
+    decode_span_cursor,
+    encode_cursor,
+    encode_span_cursor,
+)
 from query.api.errors import QueryError, QueryErrorCode
 from query.api.settings import Settings, get_settings
 from schemas.tenancy import TenantContext
+from storage.aggregates import ClaimFindingCounts, CostBucket, TokenAggregate
 from storage.backend import TelemetryStore
 from storage.errors import StorageUnavailableError
 
@@ -233,6 +240,58 @@ def _resolve_window(since: str | None, until: str | None) -> tuple[datetime, dat
     return since_dt, until_dt
 
 
+def _narrow_tenant(
+    tenant_context: TenantContext,
+    *,
+    project_id: str | None,
+    application_id: str | None,
+) -> TenantContext:
+    """Lets a caller authorized for a broad scope (a whole tenant, or one
+    project across applications) narrow a single read to one
+    project/application (`docs/storage-query.md`: "authorized
+    project/application filters"). Never widens: a key already narrowed by
+    `authenticate()` to one project/application cannot request a
+    different, broader, or sibling scope through these parameters --
+    `TenantContext.authorizes` is the same check the storage layer's own
+    post-fetch authorization already applies elsewhere
+    (`storage/postgres/backend.py`'s `get_trace`).
+
+    Deliberately `FORBIDDEN`, not `NOT_FOUND`: `QueryError`'s own
+    docstring reserves `NOT_FOUND` for a single resource looked up by ID,
+    where returning `FORBIDDEN` would itself leak that the ID exists under
+    a different tenant/scope. A caller-supplied project/application filter
+    on a list/aggregate route leaks nothing either way -- the caller typed
+    the value themselves -- so this is an ordinary capability-boundary
+    rejection, not an existence question."""
+    if project_id is None and application_id is None:
+        return tenant_context
+    effective_project_id = project_id if project_id is not None else tenant_context.project_id
+    effective_application_id = (
+        application_id if application_id is not None else tenant_context.application_id
+    )
+    if not tenant_context.authorizes(effective_project_id, effective_application_id):
+        raise QueryError(
+            QueryErrorCode.FORBIDDEN,
+            "the requested project/application scope is outside this API key's authorization",
+        )
+    return TenantContext(
+        tenant_id=tenant_context.tenant_id,
+        project_id=effective_project_id,
+        application_id=effective_application_id,
+    )
+
+
+def _filters_json(tenant_context: TenantContext) -> dict[str, str | None]:
+    """The resolved, effective project/application scope for this read --
+    `docs/storage-query.md`'s own target shape names `filters` alongside
+    `window`/`sample_count`; every aggregate/list route below had been
+    sending a permanently empty `{}` instead."""
+    return {
+        "project_id": tenant_context.project_id,
+        "application_id": tenant_context.application_id,
+    }
+
+
 @app.get("/v0.1/ai/evaluations")
 async def list_evaluations(
     tenant_context: Annotated[TenantContext, Depends(authenticate)],
@@ -243,6 +302,8 @@ async def list_evaluations(
     until: str | None = None,
     limit: int | None = None,
     cursor: str | None = None,
+    project_id: str | None = None,
+    application_id: str | None = None,
 ) -> JSONResponse:
     """OBS-07 stage-3: evaluation listing using only existing
     `ReliabilityEvent` data -- no trace/span fields, per ADR-021's
@@ -252,7 +313,14 @@ async def list_evaluations(
     than a fixed constant: a continuation request is expected to omit
     them and let the cursor carry its originally-resolved values forward
     (ADR-021); a continuation request that supplies one anyway is checked
-    for consistency with the cursor, not silently overridden by it."""
+    for consistency with the cursor, not silently overridden by it.
+    `project_id`/`application_id` narrow the caller's own authorized scope
+    (`_narrow_tenant`) and are likewise bound into the cursor -- a
+    continuation page can never silently drop or widen the narrowing its
+    first page was issued under."""
+    scoped_tenant = _narrow_tenant(
+        tenant_context, project_id=project_id, application_id=application_id
+    )
     since_param = _parse_timestamp(since, "since") if since else None
     until_param = _parse_timestamp(until, "until") if until else None
     if limit is not None and not (1 <= limit <= MAX_LIST_LIMIT):
@@ -266,9 +334,9 @@ async def list_evaluations(
             since_dt, until_dt, resolved_limit, occurred_at, event_id = decode_cursor(
                 cursor,
                 secret=settings.query_cursor_secret,
-                tenant_id=tenant_context.tenant_id,
-                project_id=tenant_context.project_id,
-                application_id=tenant_context.application_id,
+                tenant_id=scoped_tenant.tenant_id,
+                project_id=scoped_tenant.project_id,
+                application_id=scoped_tenant.application_id,
                 since=since_param,
                 until=until_param,
                 limit=limit,
@@ -282,7 +350,7 @@ async def list_evaluations(
 
     try:
         page = await store.list_reliability_events(
-            tenant_context, since=since_dt, until=until_dt, limit=resolved_limit, after=after
+            scoped_tenant, since=since_dt, until=until_dt, limit=resolved_limit, after=after
         )
     except StorageUnavailableError as exc:
         raise QueryError(
@@ -294,9 +362,9 @@ async def list_evaluations(
         next_occurred_at, next_event_id = page.next_position
         next_cursor = encode_cursor(
             secret=settings.query_cursor_secret,
-            tenant_id=tenant_context.tenant_id,
-            project_id=tenant_context.project_id,
-            application_id=tenant_context.application_id,
+            tenant_id=scoped_tenant.tenant_id,
+            project_id=scoped_tenant.project_id,
+            application_id=scoped_tenant.application_id,
             since=since_dt,
             until=until_dt,
             limit=resolved_limit,
@@ -315,6 +383,7 @@ async def list_evaluations(
             "next_cursor": next_cursor,
             "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
             "as_of": datetime.now(timezone.utc).isoformat(),
+            "filters": _filters_json(scoped_tenant),
         },
     )
 
@@ -326,16 +395,21 @@ async def get_evaluation_aggregates(
     store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
     since: str | None = None,
     until: str | None = None,
+    project_id: str | None = None,
+    application_id: str | None = None,
 ) -> JSONResponse:
     """OBS-07/14 stage-3: score/cost aggregates grouped by calibration
     class, using only existing `ReliabilityEvent` data. Registered before
     `/v0.1/ai/evaluations/{evaluation_id}` below -- otherwise "aggregates"
     would be captured as a path-matched evaluation_id instead of reaching
     this route."""
+    scoped_tenant = _narrow_tenant(
+        tenant_context, project_id=project_id, application_id=application_id
+    )
     since_dt, until_dt = _resolve_window(since, until)
     try:
         aggregates = await store.aggregate_reliability_events(
-            tenant_context, since=since_dt, until=until_dt
+            scoped_tenant, since=since_dt, until=until_dt
         )
     except StorageUnavailableError as exc:
         raise QueryError(
@@ -353,7 +427,7 @@ async def get_evaluation_aggregates(
             "schema_version": "0.1",
             "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
             "as_of": datetime.now(timezone.utc).isoformat(),
-            "filters": {},
+            "filters": _filters_json(scoped_tenant),
             "sample_count": sum(agg.count for agg in aggregates),
             "metrics": {
                 "calibration_classes": [
@@ -389,6 +463,242 @@ async def get_evaluation_aggregates(
     )
 
 
+def _cost_buckets_json(buckets: list[CostBucket]) -> list[dict[str, object]]:
+    """Shared by `/v0.1/ai/overview` and `/v0.1/ai/models` below --
+    `get_evaluation_aggregates` above inlines the same shape once; this
+    one is reused twice, so it earns being named."""
+    return [
+        {
+            "currency": bucket.currency,
+            "pricing_version": bucket.pricing_version,
+            "amount": bucket.amount,
+            "measured_count": bucket.measured_count,
+        }
+        for bucket in buckets
+    ]
+
+
+def _tokens_json(tokens: TokenAggregate) -> dict[str, object]:
+    return {
+        "input_tokens": tokens.input_tokens,
+        "output_tokens": tokens.output_tokens,
+        "total_tokens": tokens.total_tokens,
+        "measured_count": tokens.measured_count,
+        "unknown_count": tokens.unknown_count,
+    }
+
+
+@app.get("/v0.1/ai/overview")
+async def get_overview(
+    tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+    since: str | None = None,
+    until: str | None = None,
+    project_id: str | None = None,
+    application_id: str | None = None,
+) -> JSONResponse:
+    """OBS-05/06's span-derived aggregate (`docs/LOW_LEVEL_IMPLEMENTATION.md`:
+    "GET /v0.1/ai/overview | Window/bucket request rate, errors, latency
+    percentiles, tokens, cost and reliability coverage"). Combines
+    `TelemetryStore.aggregate_spans` (request/error/latency/token/cost)
+    with `aggregate_trace_evaluation_coverage` (the coverage cell,
+    including `NOT_EVALUATED`) -- two separate storage calls over the
+    same window, not two routes, since `docs/dashboard.md`'s own Overview
+    cell set treats them as one view sharing one window/freshness/sample
+    count. Returns counts only, never a pre-computed rate -- a caller
+    divides `error_count` by `known_status_count` itself, the same
+    "never hide the denominator" rule `get_evaluation_aggregates` above
+    already follows for cost/score averages."""
+    scoped_tenant = _narrow_tenant(
+        tenant_context, project_id=project_id, application_id=application_id
+    )
+    since_dt, until_dt = _resolve_window(since, until)
+    try:
+        spans_aggregate = await store.aggregate_spans(scoped_tenant, since=since_dt, until=until_dt)
+        coverage = await store.aggregate_trace_evaluation_coverage(
+            scoped_tenant, since=since_dt, until=until_dt
+        )
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+    return JSONResponse(
+        status_code=200,
+        content={
+            "schema_version": "0.1",
+            "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "filters": _filters_json(scoped_tenant),
+            "sample_count": spans_aggregate.count,
+            "metrics": {
+                "request_count": spans_aggregate.count,
+                "known_status_count": spans_aggregate.known_status_count,
+                "error_count": spans_aggregate.error_count,
+                "latency_p50_ms": spans_aggregate.latency_p50_ms,
+                "latency_p95_ms": spans_aggregate.latency_p95_ms,
+                "latency_measured_count": spans_aggregate.latency_measured_count,
+                "tokens": _tokens_json(spans_aggregate.tokens),
+                "cost_buckets": _cost_buckets_json(spans_aggregate.cost_buckets),
+                "cost_unavailable_count": spans_aggregate.cost_unavailable_count,
+                "reliability_coverage": {
+                    "total_traces": coverage.total_traces,
+                    "not_evaluated_count": coverage.not_evaluated_count,
+                    "pending_count": coverage.pending_count,
+                    "available_count": coverage.available_count,
+                    "reconciliation_expired_count": coverage.reconciliation_expired_count,
+                },
+            },
+        },
+    )
+
+
+@app.get("/v0.1/ai/models")
+async def get_models(
+    tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+    since: str | None = None,
+    until: str | None = None,
+    project_id: str | None = None,
+    application_id: str | None = None,
+) -> JSONResponse:
+    """OBS-05/06's span-derived aggregate (`docs/LOW_LEVEL_IMPLEMENTATION.md`:
+    "GET /v0.1/ai/models | Provider/model/version groups with request,
+    error, latency, token and cost aggregates"). `TelemetryStore.
+    aggregate_models` already retains an explicit `(None, None, None)`
+    "unknown" group rather than dropping unattributed spans
+    (`docs/LOW_LEVEL_IMPLEMENTATION.md`: "Model view ... retains unknown
+    bucket")."""
+    scoped_tenant = _narrow_tenant(
+        tenant_context, project_id=project_id, application_id=application_id
+    )
+    since_dt, until_dt = _resolve_window(since, until)
+    try:
+        aggregates = await store.aggregate_models(scoped_tenant, since=since_dt, until=until_dt)
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+    return JSONResponse(
+        status_code=200,
+        content={
+            "schema_version": "0.1",
+            "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "filters": _filters_json(scoped_tenant),
+            "sample_count": sum(agg.count for agg in aggregates),
+            "metrics": {
+                "models": [
+                    {
+                        "provider_id": agg.provider_id,
+                        "model_id": agg.model_id,
+                        "model_version": agg.model_version,
+                        "count": agg.count,
+                        "known_status_count": agg.known_status_count,
+                        "error_count": agg.error_count,
+                        "latency_p50_ms": agg.latency_p50_ms,
+                        "latency_p95_ms": agg.latency_p95_ms,
+                        "latency_measured_count": agg.latency_measured_count,
+                        "tokens": _tokens_json(agg.tokens),
+                        "cost_buckets": _cost_buckets_json(agg.cost_buckets),
+                        "cost_unavailable_count": agg.cost_unavailable_count,
+                    }
+                    for agg in aggregates
+                ]
+            },
+        },
+    )
+
+
+@app.get("/v0.1/ai/requests")
+async def list_requests(
+    tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    since: str | None = None,
+    until: str | None = None,
+    limit: int | None = None,
+    cursor: str | None = None,
+    project_id: str | None = None,
+    application_id: str | None = None,
+) -> JSONResponse:
+    """`docs/LOW_LEVEL_IMPLEMENTATION.md`'s named `/v0.1/ai/requests` list
+    -- one row per span (`storage.aggregates.SpanPage`'s own docstring:
+    "one request" is one span, the same unit `aggregate_spans`'s `count`
+    already uses), newest `started_at` first. `list_evaluations`'s own
+    pagination/narrowing/cursor-binding shape exactly, with `list_spans`/
+    `encode_span_cursor`/`decode_span_cursor` standing in for the
+    evaluation-event equivalents -- a distinct cursor sort-order value
+    means a cursor minted here can never be replayed against
+    `/v0.1/ai/evaluations` or vice versa."""
+    scoped_tenant = _narrow_tenant(
+        tenant_context, project_id=project_id, application_id=application_id
+    )
+    since_param = _parse_timestamp(since, "since") if since else None
+    until_param = _parse_timestamp(until, "until") if until else None
+    if limit is not None and not (1 <= limit <= MAX_LIST_LIMIT):
+        raise QueryError(
+            QueryErrorCode.INVALID_ARGUMENT, f"limit must be between 1 and {MAX_LIST_LIMIT}"
+        )
+
+    after: tuple[datetime, str] | None = None
+    if cursor is not None:
+        try:
+            since_dt, until_dt, resolved_limit, started_at, span_id = decode_span_cursor(
+                cursor,
+                secret=settings.query_cursor_secret,
+                tenant_id=scoped_tenant.tenant_id,
+                project_id=scoped_tenant.project_id,
+                application_id=scoped_tenant.application_id,
+                since=since_param,
+                until=until_param,
+                limit=limit,
+            )
+        except CursorError as exc:
+            raise QueryError(QueryErrorCode.INVALID_ARGUMENT, str(exc)) from exc
+        after = (started_at, span_id)
+    else:
+        since_dt, until_dt = _resolve_window(since, until)
+        resolved_limit = limit if limit is not None else DEFAULT_LIST_LIMIT
+
+    try:
+        page = await store.list_spans(
+            scoped_tenant, since=since_dt, until=until_dt, limit=resolved_limit, after=after
+        )
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+
+    next_cursor = None
+    if page.next_position is not None:
+        next_started_at, next_span_id = page.next_position
+        next_cursor = encode_span_cursor(
+            secret=settings.query_cursor_secret,
+            tenant_id=scoped_tenant.tenant_id,
+            project_id=scoped_tenant.project_id,
+            application_id=scoped_tenant.application_id,
+            since=since_dt,
+            until=until_dt,
+            limit=resolved_limit,
+            started_at=next_started_at,
+            span_id=next_span_id,
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "schema_version": "0.1",
+            "items": [span.model_dump(mode="json", exclude_none=True) for span in page.items],
+            "next_cursor": next_cursor,
+            "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "filters": _filters_json(scoped_tenant),
+        },
+    )
+
+
 @app.get("/v0.1/ai/evaluations/{evaluation_id}")
 async def get_evaluation(
     evaluation_id: str,
@@ -405,6 +715,116 @@ async def get_evaluation(
     if event is None:
         raise QueryError(QueryErrorCode.NOT_FOUND, "evaluation not found")
     return JSONResponse(status_code=200, content=event.model_dump(mode="json", exclude_none=True))
+
+
+def _claim_counts_json(counts: ClaimFindingCounts) -> dict[str, object]:
+    """ADR-022's counts, with the availability flag that makes them
+    readable. `projection_available` is what lets a consumer tell "no
+    claims were found" from "no producer published claims" -- without it
+    every count below is an unreadable zero. Shared by the per-evaluation
+    route and the aggregate route so the two can never disagree on the
+    shape."""
+    return {
+        "projection_available": counts.projection_available,
+        "supported_count": counts.supported_count,
+        "unsupported_count": counts.unsupported_count,
+        "contradicted_count": counts.contradicted_count,
+        "insufficient_evidence_count": counts.insufficient_evidence_count,
+        "total_claim_count": counts.total_claim_count,
+        "no_finding_count": counts.no_finding_count,
+        "evaluations_with_projection": counts.evaluations_with_projection,
+        "evaluations_without_projection": counts.evaluations_without_projection,
+    }
+
+
+@app.get("/v0.1/ai/evaluations/{evaluation_id}/claims")
+async def get_evaluation_claims(
+    evaluation_id: str,
+    tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+) -> JSONResponse:
+    """ADR-022: the request -> trace -> evaluation -> claim leg of G8's
+    navigation path.
+
+    Carries claim identities, finding statuses and bounded rationale codes
+    only -- there is no claim text, prompt, response, evidence or
+    free-form rationale in this projection to return. A 404 covers both a
+    missing evaluation and one outside the caller's scope, the same
+    existence-privacy rule `get_evaluation` applies.
+
+    `claims` being `[]` is NOT self-explanatory, which is why
+    `counts.projection_available` travels with it: `false` means the
+    producer never published claim data (render "unavailable"), `true`
+    with an empty list means the evaluation genuinely had no claims."""
+    try:
+        claims = await store.get_evaluation_claims(tenant_context, evaluation_id)
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+    if claims is None:
+        raise QueryError(QueryErrorCode.NOT_FOUND, "evaluation not found")
+    return JSONResponse(
+        status_code=200,
+        content={
+            "schema_version": "0.1",
+            "evaluation_id": claims.evaluation_id,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "filters": _filters_json(tenant_context),
+            "claims": [
+                {
+                    "claim_id": finding.claim_id,
+                    "status": finding.status,
+                    "rationale_code": finding.rationale_code,
+                }
+                for finding in claims.findings
+            ],
+            "metrics": _claim_counts_json(claims.counts),
+        },
+    )
+
+
+@app.get("/v0.1/ai/claims/aggregates")
+async def get_claim_aggregates(
+    tenant_context: Annotated[TenantContext, Depends(authenticate)],
+    _tenant_quota: Annotated[None, Depends(enforce_tenant_concurrency_limit)],
+    store: Annotated[TelemetryStore, Depends(get_telemetry_store)],
+    since: str | None = None,
+    until: str | None = None,
+    project_id: str | None = None,
+    application_id: str | None = None,
+) -> JSONResponse:
+    """ADR-022's aggregate claim view -- supported/unsupported/
+    contradicted/insufficient-evidence counts over one window, which is
+    what the Reliability page's claim cells render.
+
+    Registered under `/v0.1/ai/claims/`, not as another
+    `/v0.1/ai/evaluations/...` sub-path, so it cannot be shadowed by the
+    `/{evaluation_id}` catch-all the way `/aggregates` had to be ordered
+    around."""
+    scoped_tenant = _narrow_tenant(
+        tenant_context, project_id=project_id, application_id=application_id
+    )
+    since_dt, until_dt = _resolve_window(since, until)
+    try:
+        counts = await store.aggregate_claim_findings(scoped_tenant, since=since_dt, until=until_dt)
+    except StorageUnavailableError as exc:
+        raise QueryError(
+            QueryErrorCode.DEPENDENCY_UNAVAILABLE, "durable storage is temporarily unavailable"
+        ) from exc
+    return JSONResponse(
+        status_code=200,
+        content={
+            "schema_version": "0.1",
+            "window": {"since": since_dt.isoformat(), "until": until_dt.isoformat()},
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "filters": _filters_json(scoped_tenant),
+            "sample_count": counts.evaluations_with_projection
+            + counts.evaluations_without_projection,
+            "metrics": _claim_counts_json(counts),
+        },
+    )
 
 
 @app.get("/v0.1/ai/traces/{trace_id}")

@@ -33,7 +33,7 @@ from operations.request_deadline import RequestDeadlineMiddleware
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
 from storage.backend import TelemetryStore
-from storage.errors import StorageUnavailableError
+from storage.errors import ClaimSummaryConflictError, StorageUnavailableError
 from storage.spans import SpanRecordOutcome
 
 logger = logging.getLogger(__name__)
@@ -303,6 +303,17 @@ async def receive_reliability_event(
             IngressErrorCode.DEPENDENCY_UNAVAILABLE,
             "durable storage is temporarily unavailable",
         ) from exc
+    except ClaimSummaryConflictError as exc:
+        # ADR-022: a second event asserting a *different* finding for a
+        # claim identity already recorded. Deliberately a non-retryable
+        # 409, not a 503: redelivering the same body will keep conflicting,
+        # so this needs a producer fix, not a retry. `exc.details` is
+        # already bounded (`MAX_REPORTED_CLAIM_CONFLICTS`) and carries only
+        # claim identities and the disagreeing bounded enum values -- this
+        # projection holds no claim text to leak. Not counted here:
+        # `handle_ingress_error` already counts every route-raised
+        # IngressError exactly once by its own code.
+        raise IngressError(IngressErrorCode.CONFLICT, exc.message, details=exc.details) from exc
 
     INGRESS_EVENTS_TOTAL.labels(outcome="accepted" if newly_inserted else "duplicate").inc()
     response_body: dict[str, Any] = {

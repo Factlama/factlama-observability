@@ -30,6 +30,12 @@ dashboard; short enough that a leaked/bookmarked cursor does not grant
 indefinite replay against a since-changed authorization scope."""
 
 SORT_ORDER = "occurred_at_desc"
+SORT_ORDER_SPANS = "started_at_desc"
+"""`GET /v0.1/ai/requests`'s own sort order -- a distinct value (not
+reused from `SORT_ORDER` above) so a cursor minted for one route's keyset
+(`occurred_at`/`event_id`) is never silently decoded as the other's
+(`started_at`/`span_id`); `decode_span_cursor`'s own sort-order check
+rejects a cross-issued cursor outright."""
 
 
 class CursorError(ValueError):
@@ -129,6 +135,89 @@ def decode_cursor(
         raise CursorError("cursor is malformed")
 
     return cursor_since, cursor_until, cursor_limit, occurred_at, event_id
+
+
+def encode_span_cursor(
+    *,
+    secret: str,
+    tenant_id: str,
+    project_id: str | None,
+    application_id: str | None,
+    since: datetime,
+    until: datetime,
+    limit: int,
+    started_at: datetime,
+    span_id: str,
+) -> str:
+    """`encode_cursor`'s own span-level equivalent -- `GET
+    /v0.1/ai/requests`'s keyset marker is `(started_at, span_id)`, not
+    `(occurred_at, event_id)`."""
+    payload: dict[str, Any] = {
+        "v": QUERY_VERSION,
+        "tenant_id": tenant_id,
+        "project_id": project_id,
+        "application_id": application_id,
+        "since": since.isoformat(),
+        "until": until.isoformat(),
+        "limit": limit,
+        "sort": SORT_ORDER_SPANS,
+        "exp": (datetime.now(timezone.utc) + CURSOR_TTL).isoformat(),
+        "started_at": started_at.isoformat(),
+        "span_id": span_id,
+    }
+    return _sign_and_encode(payload, secret)
+
+
+def decode_span_cursor(
+    cursor: str,
+    *,
+    secret: str,
+    tenant_id: str,
+    project_id: str | None,
+    application_id: str | None,
+    since: datetime | None,
+    until: datetime | None,
+    limit: int | None,
+) -> tuple[datetime, datetime, int, datetime, str]:
+    """`decode_cursor`'s own span-level equivalent. Returns `(since,
+    until, limit, started_at, span_id)`."""
+    payload = _verify_and_decode(cursor, secret)
+
+    if payload.get("v") != QUERY_VERSION:
+        raise CursorError("cursor was issued by an incompatible query version")
+    if payload.get("sort") != SORT_ORDER_SPANS:
+        raise CursorError("cursor was issued under a different sort order")
+
+    expires_at = _parse_timestamp(payload, "exp")
+    if datetime.now(timezone.utc) >= expires_at:
+        raise CursorError("cursor has expired; restart from the first page")
+
+    if payload.get("tenant_id") != tenant_id:
+        raise CursorError("cursor was issued for a different tenant")
+    if payload.get("project_id") != project_id:
+        raise CursorError("cursor was issued for a different project scope")
+    if payload.get("application_id") != application_id:
+        raise CursorError("cursor was issued for a different application scope")
+
+    cursor_since = _parse_timestamp(payload, "since")
+    cursor_until = _parse_timestamp(payload, "until")
+    cursor_limit = payload.get("limit")
+    if not isinstance(cursor_limit, int):
+        raise CursorError("cursor is malformed")
+
+    if since is not None and since != cursor_since:
+        raise CursorError("since does not match the window this cursor was issued for")
+    if until is not None and until != cursor_until:
+        raise CursorError("until does not match the window this cursor was issued for")
+    if limit is not None and limit != cursor_limit:
+        raise CursorError("limit does not match the page size this cursor was issued for")
+
+    started_at = _parse_timestamp(payload, "started_at")
+    span_id = payload.get("span_id")
+    if not isinstance(span_id, str):
+        raise CursorError("cursor is malformed")
+
+    return cursor_since, cursor_until, cursor_limit, started_at, span_id
 
 
 def _canonical_json(payload: dict[str, Any]) -> bytes:

@@ -484,6 +484,27 @@ class TestListEvaluations:
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
 
+    def test_response_echoes_resolved_filters(self, client: TestClient) -> None:
+        response = _list(client, token=TENANT_ONE_KEY)
+        assert response.json()["filters"] == {"project_id": None, "application_id": None}
+
+    def test_unscoped_key_can_narrow_to_one_project(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        _seed(store, make_event(tenant_id="tenant-one", event_id="e1", project_id="proj-a"))
+        _seed(store, make_event(tenant_id="tenant-one", event_id="e2", project_id="proj-b"))
+        response = _list(client, token=TENANT_ONE_KEY, project_id="proj-a")
+        assert response.status_code == 200, response.text
+        assert [item["event_id"] for item in response.json()["items"]] == ["e1"]
+        assert response.json()["filters"] == {"project_id": "proj-a", "application_id": None}
+
+    def test_scoped_key_requesting_a_different_project_is_forbidden(
+        self, client: TestClient
+    ) -> None:
+        response = _list(client, token=TENANT_ONE_SCOPED_KEY, project_id="proj-b")
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "FORBIDDEN"
+
     def test_cursor_pagination_does_not_skip_or_duplicate(
         self, client: TestClient, store: FakeTelemetryStore
     ) -> None:
@@ -598,6 +619,13 @@ class TestEvaluationAggregates:
         response = _aggregates(client, token=TENANT_ONE_KEY)
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+
+    def test_scoped_key_requesting_a_different_application_is_forbidden(
+        self, client: TestClient
+    ) -> None:
+        response = _aggregates(client, token="app-scoped-key", application_id="app-b")
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "FORBIDDEN"
 
     def test_the_aggregates_path_segment_does_not_collide_with_evaluation_lookup(
         self, client: TestClient, store: FakeTelemetryStore

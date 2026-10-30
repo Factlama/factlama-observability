@@ -13,7 +13,7 @@ ahead of the now-canonical `AITrace`/span contract, the same reason OBS-03
 originally deferred the model.
 """
 
-from sqlalchemy import Boolean, Column, DateTime, Index, MetaData, String, Table
+from sqlalchemy import Boolean, Column, DateTime, Index, Integer, MetaData, String, Table
 from sqlalchemy.dialects.postgresql import JSONB
 
 metadata = MetaData()
@@ -41,6 +41,13 @@ reliability_events = Table(
     Column("calibration_classes_json", JSONB, nullable=True),
     Column("qualification_status", String(32), nullable=False),
     Column("usage_summary_json", JSONB, nullable=False),
+    # ADR-022: NULL means this event carried no claim projection at all --
+    # read downstream as "claim data unavailable", which is a different
+    # state from 0 ("the evaluation genuinely had no claims"). Nullable is
+    # load-bearing here, not laziness: collapsing the two would report a
+    # clean reliability picture for producers that simply do not publish
+    # claims, the false-metric outcome ADR-022 rejects by name.
+    Column("claim_total_count", Integer, nullable=True),
     Column("received_at", DateTime(timezone=True), nullable=False),
     # storage-query.md: "Indexes include tenant and time before
     # high-cardinality IDs" -- supports a future evaluation-detail lookup
@@ -148,4 +155,36 @@ retired_evaluations = Table(
     Column("tenant_id", String(128), primary_key=True),
     Column("evaluation_id", String(128), primary_key=True),
     Column("retired_at", DateTime(timezone=True), nullable=False),
+)
+
+
+evaluation_claims = Table(
+    "evaluation_claims",
+    metadata,
+    # ADR-022: claim identity is (tenant, evaluation, claim) -- "a stable
+    # claim identifier scoped to the evaluation". The primary key is what
+    # makes a replayed event idempotent; `record_reliability_event`
+    # compares an already-stored row's own status/rationale before
+    # accepting, so a *conflicting* second assertion for this identity is
+    # rejected rather than silently overwriting the first.
+    #
+    # Deliberately its own table rather than a JSONB blob on
+    # `reliability_events`: the claim counts are aggregated across many
+    # evaluations in one window (the Reliability view), and tenant/project
+    # scoping has to be a real indexed predicate, not a JSON traversal.
+    Column("tenant_id", String(128), primary_key=True),
+    Column("evaluation_id", String(128), primary_key=True),
+    Column("claim_id", String(128), primary_key=True),
+    # Copied from the owning event so a scoped aggregate never has to join
+    # back to `reliability_events` -- the same denormalization
+    # `evaluation_links` already makes, and for the same reason: scope must
+    # be filterable in SQL. Nullable exactly as the event's own are.
+    Column("project_id", String(128), nullable=True),
+    Column("application_id", String(128), nullable=True),
+    Column("status", String(32), nullable=False),
+    Column("rationale_code", String(64), nullable=True),
+    Column("received_at", DateTime(timezone=True), nullable=False),
+    # The Reliability view aggregates every claim for a tenant (optionally
+    # narrowed by project/application) in one window.
+    Index("ix_evaluation_claims_tenant_received", "tenant_id", "received_at"),
 )

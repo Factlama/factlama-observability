@@ -62,3 +62,33 @@ async def test_delete_reliability_events_translates_a_bare_connection_os_error()
     store = PostgresTelemetryStore(_BrokenEngine())  # type: ignore[arg-type]
     with pytest.raises(StorageUnavailableError):
         await store.delete_reliability_events("tenant-a", before=datetime.now(timezone.utc))
+
+
+async def test_aggregate_spans_translates_a_bare_connection_os_error() -> None:
+    store = PostgresTelemetryStore(_BrokenEngine())  # type: ignore[arg-type]
+    now = datetime.now(timezone.utc)
+    with pytest.raises(StorageUnavailableError):
+        await store.aggregate_spans(TenantContext(tenant_id="tenant-a"), since=now, until=now)
+
+
+async def test_aggregate_models_translates_a_bare_connection_os_error() -> None:
+    store = PostgresTelemetryStore(_BrokenEngine())  # type: ignore[arg-type]
+    now = datetime.now(timezone.utc)
+    with pytest.raises(StorageUnavailableError):
+        await store.aggregate_models(TenantContext(tenant_id="tenant-a"), since=now, until=now)
+
+
+async def test_aggregate_trace_evaluation_coverage_translates_a_bare_connection_os_error() -> None:
+    store = PostgresTelemetryStore(_BrokenEngine())  # type: ignore[arg-type]
+    now = datetime.now(timezone.utc)
+    with pytest.raises(StorageUnavailableError):
+        await store.aggregate_trace_evaluation_coverage(
+            TenantContext(tenant_id="tenant-a"), since=now, until=now
+        )
+
+
+async def test_list_spans_translates_a_bare_connection_os_error() -> None:
+    store = PostgresTelemetryStore(_BrokenEngine())  # type: ignore[arg-type]
+    now = datetime.now(timezone.utc)
+    with pytest.raises(StorageUnavailableError):
+        await store.list_spans(TenantContext(tenant_id="tenant-a"), since=now, until=now, limit=50)

@@ -23,7 +23,11 @@ from collector.ingress.app import app, get_storage_readiness, get_telemetry_stor
 from collector.ingress.settings import Settings, get_settings
 from operations.concurrency import ConcurrencyLimiter
 from schemas.reliability_event import ReliabilityEvent
-from storage.errors import StorageUnavailableError
+from storage.errors import (
+    MAX_REPORTED_CLAIM_CONFLICTS,
+    ClaimSummaryConflictError,
+    StorageUnavailableError,
+)
 
 WORKLOAD_TOKEN = "test-workload-token"
 VALID_EVENT = {
@@ -50,11 +54,34 @@ class FakeTelemetryStore:
     def __init__(self) -> None:
         self._events: dict[tuple[str, str], ReliabilityEvent] = {}
         self.fail_next = False
+        self.conflict_next = False
 
     async def record_reliability_event(self, event: ReliabilityEvent) -> bool:
         if self.fail_next:
             self.fail_next = False
             raise StorageUnavailableError("simulated storage outage")
+        if self.conflict_next:
+            self.conflict_next = False
+            # Shape mirrors `PostgresTelemetryStore._record_claim_summary`'s
+            # own bounded `details`; that method's real behavior against
+            # live PostgreSQL is proven in
+            # `tests/conformance/test_claim_summary_storage.py`.
+            raise ClaimSummaryConflictError(
+                "conflicting claim findings",
+                details={
+                    "evaluation_id": event.evaluation_id,
+                    "conflicts": [
+                        {
+                            "claim_id": "c1",
+                            "stored_status": "SUPPORTED",
+                            "stored_rationale_code": "DIRECT_SUPPORT",
+                            "incoming_status": "CONTRADICTED",
+                            "incoming_rationale_code": "CONTRADICTION_DETECTED",
+                        }
+                    ],
+                    "reported_conflict_limit": MAX_REPORTED_CLAIM_CONFLICTS,
+                },
+            )
         key = (event.tenant_id, event.event_id)
         if key in self._events:
             return False
@@ -114,6 +141,90 @@ class TestAcceptanceAndDedup:
         assert first.status_code == 200
         assert second.status_code == 200
         assert second.json()["status"] == "duplicate"
+
+
+class TestClaimSummaryIngestion:
+    """ADR-022 at the ingress boundary."""
+
+    def test_event_with_a_claim_summary_is_accepted(self, client: TestClient) -> None:
+        body = {
+            **VALID_EVENT,
+            "claim_summary": {
+                "total_claim_count": 2,
+                "findings": {
+                    "c1": {"status": "SUPPORTED", "rationale_code": "DIRECT_SUPPORT"},
+                    "c2": {"status": "CONTRADICTED"},
+                },
+            },
+        }
+        response = _post(client, body)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "accepted"
+
+    def test_claim_finding_carrying_content_is_rejected(self, client: TestClient) -> None:
+        """ADR-022's privacy boundary, enforced by the *consumer* too:
+        `ClaimFinding` forbids extra fields, so a producer attaching claim
+        text is rejected at ingress rather than persisted."""
+        body = {
+            **VALID_EVENT,
+            "claim_summary": {
+                "total_claim_count": 1,
+                "findings": {
+                    "c1": {
+                        "status": "SUPPORTED",
+                        "rationale_code": "DIRECT_SUPPORT",
+                        "text": "Acme was founded in 2018.",
+                    }
+                },
+            },
+        }
+        response = _post(client, body)
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+    def test_claim_finding_with_a_non_finding_status_is_rejected(self, client: TestClient) -> None:
+        """`NOT_APPLICABLE` is a valid claim *verdict* but never a
+        projected finding status -- such claims belong in
+        `total_claim_count` only."""
+        body = {
+            **VALID_EVENT,
+            "claim_summary": {
+                "total_claim_count": 1,
+                "findings": {"c1": {"status": "NOT_APPLICABLE"}},
+            },
+        }
+        assert _post(client, body).status_code == 400
+
+    def test_total_claim_count_below_the_finding_count_is_rejected(
+        self, client: TestClient
+    ) -> None:
+        """An internally inconsistent projection would make every derived
+        no-finding count negative downstream."""
+        body = {
+            **VALID_EVENT,
+            "claim_summary": {
+                "total_claim_count": 1,
+                "findings": {
+                    "c1": {"status": "SUPPORTED"},
+                    "c2": {"status": "UNSUPPORTED"},
+                },
+            },
+        }
+        assert _post(client, body).status_code == 400
+
+    def test_conflicting_claim_summary_is_a_non_retryable_409(
+        self, client: TestClient, store: FakeTelemetryStore
+    ) -> None:
+        """ADR-022: rejected with bounded diagnostics. A 409, not a 503 --
+        redelivering the same body would conflict again, so this needs a
+        producer fix, not a retry."""
+        store.conflict_next = True
+        response = _post(client, VALID_EVENT)
+        assert response.status_code == 409
+        error = response.json()["error"]
+        assert error["code"] == "CONFLICT"
+        assert error["retryable"] is False
+        assert error["details"]["conflicts"][0]["claim_id"] == "c1"
 
 
 class TestAuth:

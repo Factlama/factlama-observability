@@ -16,6 +16,7 @@ contracted retryable 503.
 """
 
 import logging
+from collections import Counter as StatusCounter
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,7 @@ from schemas.aitrace import (
 from schemas.aitrace import CostBucket as AITraceCostBucket
 from schemas.normalized_span import NormalizedSpan, OperationType, SpanStatus
 from schemas.reliability_event import (
+    ClaimFindingStatus,
     OverallVerdict,
     QualificationStatusOrMixed,
     ReliabilityEvent,
@@ -49,9 +51,17 @@ from schemas.reliability_event import (
 from schemas.tenancy import TenantContext
 from storage.aggregates import (
     CalibrationClassAggregate,
+    ClaimFindingCounts,
+    ClaimFindingRow,
     CostBucket,
+    EvaluationClaims,
     EventPage,
+    ModelAggregate,
     ScoreAggregate,
+    SpanOverviewAggregate,
+    SpanPage,
+    TokenAggregate,
+    TraceEvaluationCoverageAggregate,
 )
 from storage.backend import TelemetryStore
 from storage.correlation import (
@@ -71,8 +81,13 @@ from storage.correlation import (
     select_unique_trace_for_interaction,
     touch_link,
 )
-from storage.errors import StorageUnavailableError
+from storage.errors import (
+    MAX_REPORTED_CLAIM_CONFLICTS,
+    ClaimSummaryConflictError,
+    StorageUnavailableError,
+)
 from storage.postgres.tables import (
+    evaluation_claims,
     evaluation_links,
     reliability_events,
     retired_evaluations,
@@ -130,6 +145,12 @@ def _event_to_row(event: ReliabilityEvent, received_at: datetime) -> dict[str, A
         "calibration_classes_json": event.calibration_classes,
         "qualification_status": event.qualification_status.value,
         "usage_summary_json": event.usage_summary.model_dump(mode="json"),
+        # ADR-022: None (no projection) persists as SQL NULL, which reads
+        # back as "unavailable". 0 means the evaluation genuinely had no
+        # claims. Never conflate the two.
+        "claim_total_count": (
+            event.claim_summary.total_claim_count if event.claim_summary is not None else None
+        ),
         "received_at": received_at,
     }
 
@@ -258,6 +279,170 @@ def _tenant_scope_clauses(tenant: TenantContext) -> list[ColumnElement[bool]]:
     return clauses
 
 
+def _span_tenant_scope_clauses(tenant: TenantContext) -> list[ColumnElement[bool]]:
+    """`_tenant_scope_clauses`'s own equivalent for queries against
+    `spans` instead of `reliability_events`."""
+    clauses: list[ColumnElement[bool]] = [spans.c.tenant_id == tenant.tenant_id]
+    if tenant.project_id is not None:
+        clauses.append(spans.c.project_id == tenant.project_id)
+    if tenant.application_id is not None:
+        clauses.append(spans.c.application_id == tenant.application_id)
+    return clauses
+
+
+def _link_tenant_scope_clauses(tenant: TenantContext) -> list[ColumnElement[bool]]:
+    """`_tenant_scope_clauses`'s own equivalent for queries against
+    `evaluation_links` instead of `reliability_events`. The same tenant_id
+    can legitimately own the same trace_id under two different
+    project/application scopes (nothing in the schema forbids it), so a
+    project/application-narrowed query must apply this same narrowing to
+    `evaluation_links`, not just to `spans` -- otherwise a project-scoped
+    read can see another project's evaluation state for a trace_id it
+    happens to share (review-evidence/g8-span-aggregates-review-2026-10-29)."""
+    clauses: list[ColumnElement[bool]] = [evaluation_links.c.tenant_id == tenant.tenant_id]
+    if tenant.project_id is not None:
+        clauses.append(evaluation_links.c.project_id == tenant.project_id)
+    if tenant.application_id is not None:
+        clauses.append(evaluation_links.c.application_id == tenant.application_id)
+    return clauses
+
+
+def _claim_tenant_scope_clauses(tenant: TenantContext) -> list[ColumnElement[bool]]:
+    """`_tenant_scope_clauses`'s own equivalent for `evaluation_claims`.
+
+    The same reason `_link_tenant_scope_clauses` exists for
+    `evaluation_links`: `evaluation_claims` carries its own denormalized
+    project/application columns precisely so a project-scoped claim read
+    is an indexed SQL predicate and never has to trust that an
+    evaluation_id is unique across a tenant's projects."""
+    clauses: list[ColumnElement[bool]] = [evaluation_claims.c.tenant_id == tenant.tenant_id]
+    if tenant.project_id is not None:
+        clauses.append(evaluation_claims.c.project_id == tenant.project_id)
+    if tenant.application_id is not None:
+        clauses.append(evaluation_claims.c.application_id == tenant.application_id)
+    return clauses
+
+
+def _claim_counts(
+    *,
+    statuses: Sequence[str],
+    total_claim_count: int,
+    evaluations_with_projection: int,
+    evaluations_without_projection: int,
+) -> ClaimFindingCounts:
+    """Tallies ADR-022's four finding statuses and derives
+    `no_finding_count`.
+
+    `max(0, ...)` on the derived count is defensive, not expected:
+    `schemas.reliability_event.ClaimSummary` already rejects a projection
+    whose `total_claim_count` is below its own finding count, so the
+    subtraction cannot legitimately go negative. Clamping means a future
+    write path that bypassed that validation surfaces as a zero rather
+    than a negative count leaking into a dashboard cell."""
+    counts = StatusCounter(statuses)
+    finding_total = len(statuses)
+    return ClaimFindingCounts(
+        supported_count=counts.get(ClaimFindingStatus.SUPPORTED.value, 0),
+        unsupported_count=counts.get(ClaimFindingStatus.UNSUPPORTED.value, 0),
+        contradicted_count=counts.get(ClaimFindingStatus.CONTRADICTED.value, 0),
+        insufficient_evidence_count=counts.get(ClaimFindingStatus.INSUFFICIENT_EVIDENCE.value, 0),
+        total_claim_count=total_claim_count,
+        no_finding_count=max(0, total_claim_count - finding_total),
+        evaluations_with_projection=evaluations_with_projection,
+        evaluations_without_projection=evaluations_without_projection,
+    )
+
+
+def _percentile(sorted_values: Sequence[float], fraction: float) -> float:
+    """Nearest-rank percentile over an already-sorted sequence --
+    deliberately simple (no interpolation) since this method's own
+    inputs are fetched-and-sorted-in-Python, same tradeoff
+    `aggregate_reliability_events` already makes elsewhere in this file
+    (full-row fetch, Python-side aggregation, not a SQL window
+    function). `sorted_values` must be non-empty; callers only call this
+    once `latency_measured_count > 0`."""
+    index = min(len(sorted_values) - 1, int(fraction * len(sorted_values)))
+    return sorted_values[index]
+
+
+def _token_aggregate(usage_jsons: Sequence[dict[str, Any]]) -> TokenAggregate:
+    """`docs/LOW_LEVEL_IMPLEMENTATION.md`: "token totals use known counts
+    and report unknown count" -- a span whose `usage.total_tokens` is
+    `None` contributes to `unknown_count` only, never as zero to the
+    sums. Shared shape with `_cost_totals_by_bucket` below: both read
+    directly from a `Usage`-shaped dict (`ReliabilityEvent.usage_summary`
+    or `NormalizedSpan.usage` -- identical schema)."""
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    measured_count = 0
+    unknown_count = 0
+    for usage in usage_jsons:
+        total = usage.get("total_tokens")
+        if total is None:
+            unknown_count += 1
+            continue
+        measured_count += 1
+        total_tokens += total
+        input_tokens += usage.get("input_tokens") or 0
+        output_tokens += usage.get("output_tokens") or 0
+    return TokenAggregate(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        measured_count=measured_count,
+        unknown_count=unknown_count,
+    )
+
+
+def _span_group_statistics(
+    rows: Sequence[Any],
+) -> tuple[int, int, float | None, float | None, int, TokenAggregate, list[CostBucket], int]:
+    """Shared per-group computation for both `aggregate_spans` (one
+    group: the whole window) and `aggregate_models` (one group per
+    provider/model/version) -- same formulas, same `known_status_count`/
+    `error_count`/latency/token/cost rules either way (`storage.aggregates.
+    SpanOverviewAggregate`'s own docstring has the exact definitions).
+    Returns `(known_status_count, error_count, latency_p50_ms,
+    latency_p95_ms, latency_measured_count, tokens, cost_buckets,
+    cost_unavailable_count)`."""
+    known_status_count = 0
+    error_count = 0
+    latencies_ms: list[float] = []
+    for row in rows:
+        if row.status != SpanStatus.UNSET.value:
+            known_status_count += 1
+            if row.status == SpanStatus.ERROR.value:
+                error_count += 1
+        latencies_ms.append((row.ended_at - row.started_at).total_seconds() * 1000.0)
+
+    latencies_ms.sort()
+    latency_measured_count = len(latencies_ms)
+    latency_p50_ms = _percentile(latencies_ms, 0.50) if latencies_ms else None
+    latency_p95_ms = _percentile(latencies_ms, 0.95) if latencies_ms else None
+
+    tokens = _token_aggregate([row.usage_json for row in rows])
+    cost_totals, cost_unavailable_count = _cost_totals_by_bucket(
+        [row.usage_json.get("cost") or {} for row in rows]
+    )
+    cost_buckets = [
+        CostBucket(
+            currency=currency, pricing_version=pricing_version, amount=amount, measured_count=count
+        )
+        for currency, pricing_version, amount, count in cost_totals
+    ]
+    return (
+        known_status_count,
+        error_count,
+        latency_p50_ms,
+        latency_p95_ms,
+        latency_measured_count,
+        tokens,
+        cost_buckets,
+        cost_unavailable_count,
+    )
+
+
 class PostgresTelemetryStore(TelemetryStore):
     """See `storage.backend.TelemetryStore` for the contract this
     implements. Construct one instance per process, sharing one
@@ -297,6 +482,97 @@ class PostgresTelemetryStore(TelemetryStore):
         self._reconciliation_expired_total = reconciliation_expired_counter
         self._reconciliation_conflict_total = reconciliation_conflict_counter
 
+    async def _record_claim_summary(
+        self,
+        conn: AsyncConnection,
+        event: ReliabilityEvent,
+        received_at: datetime,
+    ) -> None:
+        """ADR-022: persist this event's claim findings, idempotently, and
+        reject a conflicting assertion rather than overwriting it.
+
+        Runs inside `record_reliability_event`'s own transaction, so a
+        rejected conflict rolls the whole event back -- accepting the
+        event while silently dropping its claims would leave
+        `claim_total_count` describing findings that were never stored.
+
+        Order matters: insert with `ON CONFLICT DO NOTHING` first, then
+        read back every row for this evaluation's claim identities and
+        compare. A row that already existed with identical status and
+        rationale code is a replay and is accepted silently; one that
+        differs is a genuine producer disagreement and raises. Doing it in
+        this order (rather than select-then-insert) keeps the check
+        correct under a concurrent insert of the same identity: the loser
+        of the race still reads the winner's committed row and compares
+        against it."""
+        summary = event.claim_summary
+        if summary is None or not summary.findings:
+            return
+
+        rows = [
+            {
+                "tenant_id": event.tenant_id,
+                "evaluation_id": event.evaluation_id,
+                "claim_id": claim_id,
+                "project_id": event.project_id,
+                "application_id": event.application_id,
+                "status": finding.status.value,
+                "rationale_code": finding.rationale_code,
+                "received_at": received_at,
+            }
+            for claim_id, finding in summary.findings.items()
+        ]
+        await conn.execute(
+            pg_insert(evaluation_claims)
+            .values(rows)
+            .on_conflict_do_nothing(index_elements=["tenant_id", "evaluation_id", "claim_id"])
+        )
+
+        stored = (
+            await conn.execute(
+                select(
+                    evaluation_claims.c.claim_id,
+                    evaluation_claims.c.status,
+                    evaluation_claims.c.rationale_code,
+                ).where(
+                    evaluation_claims.c.tenant_id == event.tenant_id,
+                    evaluation_claims.c.evaluation_id == event.evaluation_id,
+                    evaluation_claims.c.claim_id.in_(list(summary.findings)),
+                )
+            )
+        ).all()
+
+        conflicts: list[dict[str, Any]] = []
+        for row in stored:
+            finding = summary.findings[row.claim_id]
+            if row.status == finding.status.value and row.rationale_code == (
+                finding.rationale_code
+            ):
+                continue
+            if len(conflicts) < MAX_REPORTED_CLAIM_CONFLICTS:
+                # Bounded diagnostics (ADR-022): claim identity and the two
+                # disagreeing bounded values only -- there is no claim text
+                # in this projection to leak even by accident.
+                conflicts.append(
+                    {
+                        "claim_id": row.claim_id,
+                        "stored_status": row.status,
+                        "stored_rationale_code": row.rationale_code,
+                        "incoming_status": finding.status.value,
+                        "incoming_rationale_code": finding.rationale_code,
+                    }
+                )
+        if conflicts:
+            raise ClaimSummaryConflictError(
+                f"event {event.event_id!r} asserts claim findings that conflict with "
+                f"those already recorded for evaluation {event.evaluation_id!r}",
+                details={
+                    "evaluation_id": event.evaluation_id,
+                    "conflicts": conflicts,
+                    "reported_conflict_limit": MAX_REPORTED_CLAIM_CONFLICTS,
+                },
+            )
+
     async def record_reliability_event(self, event: ReliabilityEvent) -> bool:
         received_at = datetime.now(timezone.utc)
         stmt = (
@@ -313,6 +589,15 @@ class PostgresTelemetryStore(TelemetryStore):
         try:
             async with self._engine.begin() as conn:
                 inserted = (await conn.execute(stmt)).first()
+                # ADR-022: run on *every* delivery, not only a new insert.
+                # A redelivery of an already-stored event must still be
+                # checked for claim agreement -- that is exactly the
+                # "duplicate events are idempotent, conflicting ones are
+                # rejected" pair the ADR requires, and skipping it for
+                # duplicates would let a disagreeing producer slip through
+                # simply by reusing an event_id. The insert itself is
+                # `ON CONFLICT DO NOTHING`, so a true replay writes nothing.
+                await self._record_claim_summary(conn, event, received_at)
                 if inserted is not None:
                     # ADR-021: every event with evaluation_id (always set --
                     # it is a required ReliabilityEvent field) touches a
@@ -1597,6 +1882,325 @@ class PostgresTelemetryStore(TelemetryStore):
             ],
             evaluation_state=EvaluationState(evaluation_state),
         )
+
+    async def aggregate_spans(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> SpanOverviewAggregate:
+        clauses = _span_tenant_scope_clauses(tenant)
+        # Half-open [since, until), same adjacent-window rule as
+        # aggregate_reliability_events -- here over spans.started_at.
+        clauses.append(spans.c.started_at >= since)
+        clauses.append(spans.c.started_at < until)
+        stmt = select(spans).where(*clauses)
+        try:
+            async with self._engine.connect() as conn:
+                rows = (await conn.execute(stmt)).all()
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(f"could not aggregate spans: {exc}") from exc
+
+        (
+            known_status_count,
+            error_count,
+            latency_p50_ms,
+            latency_p95_ms,
+            latency_measured_count,
+            tokens,
+            cost_buckets,
+            cost_unavailable_count,
+        ) = _span_group_statistics(rows)
+        return SpanOverviewAggregate(
+            count=len(rows),
+            known_status_count=known_status_count,
+            error_count=error_count,
+            latency_p50_ms=latency_p50_ms,
+            latency_p95_ms=latency_p95_ms,
+            latency_measured_count=latency_measured_count,
+            tokens=tokens,
+            cost_buckets=cost_buckets,
+            cost_unavailable_count=cost_unavailable_count,
+        )
+
+    async def aggregate_models(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> list[ModelAggregate]:
+        clauses = _span_tenant_scope_clauses(tenant)
+        clauses.append(spans.c.started_at >= since)
+        clauses.append(spans.c.started_at < until)
+        stmt = select(spans).where(*clauses)
+        try:
+            async with self._engine.connect() as conn:
+                rows = (await conn.execute(stmt)).all()
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(f"could not aggregate models: {exc}") from exc
+
+        by_group: dict[tuple[str | None, str | None, str | None], list[Any]] = {}
+        for row in rows:
+            key = (row.provider_id, row.model_id, row.model_version)
+            by_group.setdefault(key, []).append(row)
+
+        aggregates = []
+        for (provider_id, model_id, model_version), group_rows in by_group.items():
+            (
+                known_status_count,
+                error_count,
+                latency_p50_ms,
+                latency_p95_ms,
+                latency_measured_count,
+                tokens,
+                cost_buckets,
+                cost_unavailable_count,
+            ) = _span_group_statistics(group_rows)
+            aggregates.append(
+                ModelAggregate(
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    model_version=model_version,
+                    count=len(group_rows),
+                    known_status_count=known_status_count,
+                    error_count=error_count,
+                    latency_p50_ms=latency_p50_ms,
+                    latency_p95_ms=latency_p95_ms,
+                    latency_measured_count=latency_measured_count,
+                    tokens=tokens,
+                    cost_buckets=cost_buckets,
+                    cost_unavailable_count=cost_unavailable_count,
+                )
+            )
+        # None sorts before every str in Python 3 for same-type tuples,
+        # but a mixed sort across rows raises TypeError -- same
+        # None-substitution trick _cost_totals_by_bucket already uses.
+        aggregates.sort(
+            key=lambda agg: (agg.provider_id or "", agg.model_id or "", agg.model_version or "")
+        )
+        return aggregates
+
+    async def aggregate_trace_evaluation_coverage(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> TraceEvaluationCoverageAggregate:
+        span_clauses = _span_tenant_scope_clauses(tenant)
+        span_clauses.append(spans.c.started_at >= since)
+        span_clauses.append(spans.c.started_at < until)
+        try:
+            async with self._engine.connect() as conn:
+                trace_id_rows = (
+                    await conn.execute(select(spans.c.trace_id).distinct().where(*span_clauses))
+                ).all()
+                trace_ids = [row.trace_id for row in trace_id_rows]
+                link_rows = (
+                    (
+                        await conn.execute(
+                            select(evaluation_links.c.trace_id, evaluation_links.c.state).where(
+                                *_link_tenant_scope_clauses(tenant),
+                                evaluation_links.c.trace_id.in_(trace_ids),
+                            )
+                        )
+                    ).all()
+                    if trace_ids
+                    else []
+                )
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(
+                f"could not aggregate trace evaluation coverage: {exc}"
+            ) from exc
+
+        states_by_trace: dict[str, list[str]] = {trace_id: [] for trace_id in trace_ids}
+        for row in link_rows:
+            states_by_trace.setdefault(row.trace_id, []).append(row.state)
+
+        counts = {state.value: 0 for state in EvaluationState}
+        for link_states in states_by_trace.values():
+            counts[derive_trace_evaluation_state(link_states)] += 1
+
+        return TraceEvaluationCoverageAggregate(
+            total_traces=len(trace_ids),
+            not_evaluated_count=counts[EvaluationState.NOT_EVALUATED.value],
+            pending_count=counts[EvaluationState.PENDING.value],
+            available_count=counts[EvaluationState.AVAILABLE.value],
+            reconciliation_expired_count=counts[EvaluationState.RECONCILIATION_EXPIRED.value],
+        )
+
+    async def get_evaluation_claims(
+        self, tenant: TenantContext, evaluation_id: str
+    ) -> EvaluationClaims | None:
+        """ADR-022's per-evaluation claim read.
+
+        Returns `None` when no event for this `evaluation_id` is visible in
+        the caller's scope -- indistinguishable from "no such evaluation",
+        the same existence-privacy rule `get_reliability_event` already
+        applies (`docs/storage-query.md`: "Queries must not expose
+        existence across tenants; inaccessible IDs return 404").
+
+        A found evaluation whose stored `claim_total_count` is NULL
+        reports `projection_available=False`: the producer sent no claim
+        projection. That is deliberately NOT the same return value as an
+        evaluation with a projection and zero claims, which reports
+        `projection_available=True, total_claim_count=0`."""
+        event_clauses = _tenant_scope_clauses(tenant)
+        event_clauses.append(reliability_events.c.evaluation_id == evaluation_id)
+        try:
+            async with self._engine.connect() as conn:
+                event_row = (
+                    await conn.execute(
+                        select(
+                            reliability_events.c.claim_total_count,
+                            reliability_events.c.project_id,
+                            reliability_events.c.application_id,
+                        )
+                        .where(*event_clauses)
+                        # Newest receipt wins if an evaluation somehow has
+                        # more than one event row; the claim rows
+                        # themselves are keyed by evaluation, not event.
+                        .order_by(reliability_events.c.received_at.desc())
+                        .limit(1)
+                    )
+                ).first()
+                if event_row is None:
+                    return None
+                claim_rows = (
+                    await conn.execute(
+                        select(
+                            evaluation_claims.c.claim_id,
+                            evaluation_claims.c.status,
+                            evaluation_claims.c.rationale_code,
+                        )
+                        .where(
+                            *_claim_tenant_scope_clauses(tenant),
+                            evaluation_claims.c.evaluation_id == evaluation_id,
+                        )
+                        .order_by(evaluation_claims.c.claim_id)
+                    )
+                ).all()
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(
+                f"could not read claims for evaluation {evaluation_id!r}: {exc}"
+            ) from exc
+
+        projection_available = event_row.claim_total_count is not None
+        total_claim_count = event_row.claim_total_count or 0
+        findings = [
+            ClaimFindingRow(
+                claim_id=row.claim_id, status=row.status, rationale_code=row.rationale_code
+            )
+            for row in claim_rows
+        ]
+        return EvaluationClaims(
+            evaluation_id=evaluation_id,
+            projection_available=projection_available,
+            total_claim_count=total_claim_count,
+            findings=findings,
+            counts=_claim_counts(
+                statuses=[row.status for row in claim_rows],
+                total_claim_count=total_claim_count,
+                evaluations_with_projection=1 if projection_available else 0,
+                evaluations_without_projection=0 if projection_available else 1,
+            ),
+        )
+
+    async def aggregate_claim_findings(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> ClaimFindingCounts:
+        """ADR-022's aggregate claim view, over events whose `occurred_at`
+        falls in the half-open window `[since, until)` -- the same event-time
+        window `aggregate_reliability_events` uses, so the Reliability page's
+        claim counts and its verdict/score counts describe the same set of
+        evaluations.
+
+        Claim rows are scoped by `_claim_tenant_scope_clauses` *and*
+        restricted to the evaluations selected by the windowed, scoped
+        event query -- not merely by tenant. The same reused-`trace_id`
+        class of leak ADR-021 scoping exists to prevent applies here to
+        `evaluation_id`."""
+        event_clauses = _tenant_scope_clauses(tenant)
+        event_clauses.append(reliability_events.c.occurred_at >= since)
+        event_clauses.append(reliability_events.c.occurred_at < until)
+        try:
+            async with self._engine.connect() as conn:
+                event_rows = (
+                    await conn.execute(
+                        select(
+                            reliability_events.c.evaluation_id,
+                            reliability_events.c.claim_total_count,
+                        ).where(*event_clauses)
+                    )
+                ).all()
+                evaluation_ids = sorted({row.evaluation_id for row in event_rows})
+                claim_rows = (
+                    (
+                        await conn.execute(
+                            select(evaluation_claims.c.status).where(
+                                *_claim_tenant_scope_clauses(tenant),
+                                evaluation_claims.c.evaluation_id.in_(evaluation_ids),
+                            )
+                        )
+                    ).all()
+                    if evaluation_ids
+                    else []
+                )
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(f"could not aggregate claim findings: {exc}") from exc
+
+        # One evaluation can have several event rows (a redelivery under a
+        # fresh event_id); its claim total must be counted once, and its
+        # projection counted as available if any of its events carried one.
+        totals_by_evaluation: dict[str, int | None] = {}
+        for row in event_rows:
+            existing = totals_by_evaluation.get(row.evaluation_id)
+            if row.claim_total_count is not None and (
+                existing is None or row.claim_total_count > existing
+            ):
+                totals_by_evaluation[row.evaluation_id] = row.claim_total_count
+            else:
+                totals_by_evaluation.setdefault(row.evaluation_id, existing)
+        with_projection = sum(1 for total in totals_by_evaluation.values() if total is not None)
+        return _claim_counts(
+            statuses=[row.status for row in claim_rows],
+            total_claim_count=sum(
+                total for total in totals_by_evaluation.values() if total is not None
+            ),
+            evaluations_with_projection=with_projection,
+            evaluations_without_projection=len(totals_by_evaluation) - with_projection,
+        )
+
+    async def list_spans(
+        self,
+        tenant: TenantContext,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        after: tuple[datetime, str] | None = None,
+    ) -> SpanPage:
+        """`list_reliability_events`'s own span-level equivalent -- same
+        half-open `[since, until)` window, same `(timestamp, id)` keyset
+        pagination, same "one extra row tells us if there's a next page"
+        trick, scoped by `_span_tenant_scope_clauses` instead of
+        `_tenant_scope_clauses`."""
+        clauses = _span_tenant_scope_clauses(tenant)
+        clauses.append(spans.c.started_at >= since)
+        clauses.append(spans.c.started_at < until)
+        if after is not None:
+            after_started_at, after_span_id = after
+            clauses.append(
+                tuple_(spans.c.started_at, spans.c.span_id)
+                < tuple_(literal(after_started_at), literal(after_span_id))
+            )
+        stmt = (
+            select(spans)
+            .where(*clauses)
+            .order_by(spans.c.started_at.desc(), spans.c.span_id.desc())
+            .limit(limit + 1)
+        )
+        try:
+            async with self._engine.connect() as conn:
+                rows = (await conn.execute(stmt)).all()
+        except (SQLAlchemyError, OSError, PostgresError) as exc:
+            raise StorageUnavailableError(f"could not list spans: {exc}") from exc
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        next_position = (
+            (page_rows[-1].started_at, page_rows[-1].span_id) if has_more and page_rows else None
+        )
+        return SpanPage(items=[_row_to_span(row) for row in page_rows], next_position=next_position)
 
 
 def _aggregate_rows(rows: Sequence[Any]) -> list[CalibrationClassAggregate]:

@@ -21,6 +21,7 @@ from testcontainers.community.postgres import PostgresContainer
 
 from schemas.normalized_span import NormalizedSpan, OperationType, SpanStatus
 from schemas.reliability_event import (
+    ClaimSummary,
     OverallVerdict,
     QualificationStatusOrMixed,
     ReliabilityEvent,
@@ -76,8 +77,10 @@ def make_event(
     scores: dict[str, ScoreValue] | None = None,
     usage_summary: Usage | None = None,
     occurred_at: str | None = None,
+    claim_summary: ClaimSummary | None = None,
 ) -> ReliabilityEvent:
     return ReliabilityEvent(
+        claim_summary=claim_summary,
         event_id=event_id,
         tenant_id=tenant_id,
         evaluation_id=evaluation_id,
@@ -110,6 +113,10 @@ def make_span(
     started_at: str | None = None,
     ended_at: str | None = None,
     usage: Usage | None = None,
+    status: SpanStatus = SpanStatus.OK,
+    provider_id: str | None = None,
+    model_id: str | None = None,
+    model_version: str | None = None,
 ) -> NormalizedSpan:
     now = datetime.now(timezone.utc)
     return NormalizedSpan(
@@ -124,8 +131,11 @@ def make_span(
         operation_type=operation_type,
         started_at=started_at or now.isoformat(),
         ended_at=ended_at or now.isoformat(),
-        status=SpanStatus.OK,
+        status=status,
         evaluation_id=evaluation_id,
         interaction_id=interaction_id,
         usage=usage or Usage(),
+        provider_id=provider_id,
+        model_id=model_id,
+        model_version=model_version,
     )

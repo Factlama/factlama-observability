@@ -23,7 +23,16 @@ from schemas.aitrace import AITrace
 from schemas.normalized_span import NormalizedSpan
 from schemas.reliability_event import ReliabilityEvent
 from schemas.tenancy import TenantContext
-from storage.aggregates import CalibrationClassAggregate, EventPage
+from storage.aggregates import (
+    CalibrationClassAggregate,
+    ClaimFindingCounts,
+    EvaluationClaims,
+    EventPage,
+    ModelAggregate,
+    SpanOverviewAggregate,
+    SpanPage,
+    TraceEvaluationCoverageAggregate,
+)
 from storage.spans import SpanRecordOutcome
 
 
@@ -199,6 +208,106 @@ class TelemetryStore(Protocol):
         authorized exists for this `trace_id` -- a missing trace and an
         inaccessible one are indistinguishable, same existence-privacy
         rule as `get_reliability_event`.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
+    async def aggregate_spans(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> SpanOverviewAggregate:
+        """OBS-05/06's span-derived aggregate (`docs/LOW_LEVEL_IMPLEMENTATION.md`'s
+        `GET /v0.1/ai/overview` row): request count, error rate, latency
+        p50/p95, token totals and cost over the half-open window
+        `[since, until)` of `spans.started_at`. Scoped the same way
+        `aggregate_reliability_events` is. See `storage.aggregates.
+        SpanOverviewAggregate`'s own docstring for the exact formulas.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
+    async def aggregate_models(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> list[ModelAggregate]:
+        """OBS-05/06's span-derived aggregate (`docs/LOW_LEVEL_IMPLEMENTATION.md`'s
+        `GET /v0.1/ai/models` row): the same per-group statistics as
+        `aggregate_spans`, grouped by `(provider_id, model_id,
+        model_version)`, retaining an explicit unknown bucket (all three
+        `None`) rather than dropping unattributed spans.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
+    async def list_spans(
+        self,
+        tenant: TenantContext,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        after: tuple[datetime, str] | None = None,
+    ) -> SpanPage:
+        """`GET /v0.1/ai/requests`'s backing query: a bounded, tenant/
+        project/application-scoped page of spans whose `started_at` falls
+        in the half-open window `[since, until)`, newest first --
+        `list_reliability_events`'s own span-level equivalent, same
+        keyset-pagination contract (`after` is the previous page's last
+        `(started_at, span_id)`; `limit` is the caller's already-validated
+        page size). See `storage.aggregates.SpanPage`'s own docstring for
+        why one span is "one request" here.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
+    async def get_evaluation_claims(
+        self, tenant: TenantContext, evaluation_id: str
+    ) -> EvaluationClaims | None:
+        """ADR-022: the claim findings recorded for one evaluation, scoped
+        to the caller's tenant/project/application.
+
+        `None` means no evaluation is visible in this scope -- a missing
+        evaluation and an inaccessible one are indistinguishable, the same
+        existence-privacy rule as `get_reliability_event`.
+
+        A found evaluation reports `projection_available=False` when its
+        producer sent no claim projection; that is a different result from
+        a projection carrying zero claims, and callers must render the two
+        differently (ADR-022: "distinguish zero findings from missing
+        projection data").
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
+    async def aggregate_claim_findings(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> ClaimFindingCounts:
+        """ADR-022: claim findings summed over every in-scope evaluation
+        whose `occurred_at` falls in the half-open window
+        `[since, until)` -- the same event-time window
+        `aggregate_reliability_events` uses, so claim counts and
+        verdict/score counts describe the same evaluation set.
+
+        See `storage.aggregates.ClaimFindingCounts` for the
+        unavailable/zero/populated triple the result keeps distinct.
+
+        Raises `storage.errors.StorageUnavailableError` on a durable-store
+        failure, same as every other method here."""
+        ...
+
+    async def aggregate_trace_evaluation_coverage(
+        self, tenant: TenantContext, *, since: datetime, until: datetime
+    ) -> TraceEvaluationCoverageAggregate:
+        """OBS-05/06's span-derived aggregate (`docs/LOW_LEVEL_IMPLEMENTATION.md`'s
+        `GET /v0.1/ai/overview` row's own "reliability coverage" cell):
+        one count per `EvaluationState` across every distinct `trace_id`
+        with at least one span in the half-open window `[since, until)`
+        of `spans.started_at`. See `storage.aggregates.
+        TraceEvaluationCoverageAggregate`'s own docstring for the
+        deliberate read-only/no-lazy-expiry scope of this aggregate.
 
         Raises `storage.errors.StorageUnavailableError` on a durable-store
         failure, same as every other method here."""
